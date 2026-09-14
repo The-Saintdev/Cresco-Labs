@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowUp, ChevronDown, Download, ExternalLink, Info, Paperclip, RotateCcw, Square, X } from 'lucide-react'
 import { generationErrorMessage, streamGeneration, submitGeneration, uploadReference, type ApiGeneration, type ApiUpload } from '../api'
-import { Empty, GenerationStatusBadge, KindChip, Notice } from '../components'
+import { Empty, GenerationStatusBadge, KindChip, Notice, kindIcon } from '../components'
 import { cx, downloadResult, formatDuration, nanoMoney, relativeTime } from '../lib/format'
 import { useWorkspace } from '../lib/store'
 import { useRouter } from '../lib/router'
@@ -189,7 +189,7 @@ function MediaModel({ model }: { model: ReturnType<typeof useWorkspace>['models'
     if (!prompt.trim() || busy) return
     setBusy(true); setError('')
     try {
-      const options = model.kind === 'video' ? { aspect, quality, duration } : { aspect, quality }
+      const options: Record<string, string> = model.kind === 'video' ? { aspect, quality, duration } : { aspect, quality }
       const created = (await submitGeneration(model.id, prompt.trim(), options, references.map(item => item.id))).generation
       addGeneration(created)
       setPrompt(''); setReferences([])
@@ -214,7 +214,7 @@ function MediaModel({ model }: { model: ReturnType<typeof useWorkspace>['models'
         </div>
         {mine.length ? <div className="media-grid">
           {mine.map(item => <MediaResult key={item.id} generation={item} onOpen={() => navigate(`/g/${item.id}`)} />)}
-        </div> : <Empty icon={KindChipIcon(model.kind)} title={`No ${model.kind}s yet`} text={`Describe what you want and ${model.name} will generate it below.`} />}
+        </div> : <Empty icon={kindIcon[model.kind]} title={`No ${model.kind === 'image' ? 'images' : 'videos'} yet`} text={`Describe what you want and ${model.name} will generate it below.`} />}
       </div>
     </div>
 
@@ -286,8 +286,4 @@ function Pill({ value, options, onChange }: { value: string; options: string[]; 
     </select>
     <ChevronDown size={12} />
   </label>
-}
-
-function KindChipIcon(kind: 'text' | 'image' | 'video') {
-  return kind === 'video' ? Info : Info
 }

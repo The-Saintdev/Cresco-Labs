@@ -45,11 +45,12 @@ export function matchRoute(pattern: string, path: string): Record<string, string
 
 // Plain anchors so links are real URLs: middle-click, copy-link and open-in-new-tab
 // all behave the way the browser expects.
-export function Link({ to, className, children, onClick }: { to: string; className?: string; children: ReactNode; onClick?: () => void }) {
+export function Link({ to, className, children, onClick, title }: { to: string; className?: string; children: ReactNode; onClick?: () => void; title?: string }) {
   const { navigate } = useRouter()
   return <a
     href={to}
     className={className}
+    title={title}
     onClick={event => {
       if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return
       event.preventDefault()

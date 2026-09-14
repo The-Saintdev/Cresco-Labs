@@ -46,6 +46,7 @@ export type ApiGeneration = {
   outputText?: string | null
   error?: string | null
   providerLatencyMs?: number | null
+  queuedForMs?: number | null
   completedAt?: string | null
   references?: ApiUpload[]
   createdAt: string
