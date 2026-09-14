@@ -23,11 +23,27 @@ async function waitForHealth(url) {
 test('login, authorization, and usage summary', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cresco-api-'))
   let providerBase = ''
+  const bytePlusTextBodies = []
   const providerServer = createServer(async (request, response) => {
     const requestUrl = new URL(request.url || '/', providerBase || 'http://127.0.0.1')
     const bytePlusRequest = requestUrl.pathname.startsWith('/byteplus/')
     const expectedAuthorization = bytePlusRequest ? 'Bearer byteplus-secret-value' : 'Key provider-secret-value'
     if (request.headers.authorization !== expectedAuthorization) { response.writeHead(401); return response.end('{}') }
+    if (requestUrl.pathname === '/byteplus/chat/completions' && request.method === 'POST') {
+      let raw = ''
+      for await (const chunk of request) raw += chunk
+      const body = JSON.parse(raw || '{}')
+      bytePlusTextBodies.push(body)
+      if (!body.stream) {
+        response.setHeader('content-type', 'application/json')
+        return response.end(JSON.stringify({ id: 'bp-chat-1', choices: [{ index: 0, message: { role: 'assistant', content: 'BytePlus chat response' } }] }))
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.write('data: ' + JSON.stringify({ id: 'bp-stream-1', choices: [{ delta: { content: 'Streamed ' } }] }) + '\n\n')
+      response.write('data: ' + JSON.stringify({ id: 'bp-stream-1', choices: [{ delta: { content: 'answer.' } }] }) + '\n\n')
+      response.write('data: [DONE]\n\n')
+      return response.end()
+    }
     response.setHeader('content-type', 'application/json')
     if (requestUrl.pathname === '/byteplus/responses' && request.method === 'POST') return response.end(JSON.stringify({ id: 'bp-text-1', output_text: 'BytePlus text response' }))
     if (requestUrl.pathname === '/byteplus/contents/generations/tasks' && request.method === 'POST') return response.end(JSON.stringify({ id: 'bp-video-1' }))
@@ -155,7 +171,101 @@ test('login, authorization, and usage summary', async () => {
     const bytePlusText = await bytePlusTextResponse.json()
     assert.equal(bytePlusTextResponse.status, 201)
     assert.equal(bytePlusText.generation.status, 'complete')
-    assert.equal(bytePlusText.generation.outputText, 'BytePlus text response')
+    assert.equal(bytePlusText.generation.outputText, 'BytePlus chat response')
+    assert.equal(typeof bytePlusText.generation.providerLatencyMs, 'number')
+    assert.deepEqual(bytePlusTextBodies[0].messages, [{ role: 'user', content: 'Test direct BytePlus text output.' }])
+    assert.deepEqual(bytePlusTextBodies[0].thinking, { type: 'disabled' })
+
+    const streamResponse = await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: bytePlusTextModel.model.id, prompt: 'Stream this answer.', stream: true }),
+    })
+    assert.equal(streamResponse.status, 200)
+    assert.match(streamResponse.headers.get('content-type') || '', /text\/event-stream/)
+    const streamBody = await streamResponse.text()
+    assert.match(streamBody, /event: meta/)
+    assert.match(streamBody, /event: done/)
+    const deltas = [...streamBody.matchAll(/event: delta\ndata: (.*)/g)].map(match => JSON.parse(match[1]).text)
+    assert.deepEqual(deltas, ['Streamed ', 'answer.'])
+    const streamedGeneration = JSON.parse(streamBody.split('event: done\ndata: ')[1].split('\n')[0]).generation
+    assert.equal(streamedGeneration.status, 'complete')
+    assert.equal(streamedGeneration.outputText, 'Streamed answer.')
+    assert.equal(streamedGeneration.lastProviderError, undefined)
+
+    const responsesApiModel = await (await fetch(baseUrl + '/v1/admin/models', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'BytePlus Responses', provider: 'BytePlus', kind: 'text', endpoint: 'seed-2-0-lite-260228', priceUsd: 0, textApi: 'responses', thinkingMode: 'auto' }),
+    })).json()
+    assert.equal(responsesApiModel.model.textApi, 'responses')
+    const responsesGeneration = await (await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: responsesApiModel.model.id, prompt: 'Use the responses API.' }),
+    })).json()
+    assert.equal(responsesGeneration.generation.outputText, 'BytePlus text response')
+
+    const firstThread = await (await fetch(baseUrl + '/v1/sessions', { headers })).json()
+    const glmThreads = firstThread.sessions.filter(item => item.modelId === bytePlusTextModel.model.id)
+    assert.equal(glmThreads.length, 2, 'each generation sent without a sessionId opens its own thread')
+    const glmThread = glmThreads.find(item => item.title === 'Test direct BytePlus text output.')
+    assert.ok(glmThread, 'a thread is titled after the prompt that opened it')
+    assert.equal(glmThread.generationCount, 1)
+    assert.ok(glmThreads.some(item => item.title === 'Stream this answer.'), 'streamed runs are threaded too')
+
+    const followUp = await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: bytePlusTextModel.model.id, prompt: 'A follow up in the same thread.', sessionId: glmThread.id }),
+    })
+    assert.equal(followUp.status, 201)
+    const threadDetail = await (await fetch(baseUrl + '/v1/sessions/' + glmThread.id, { headers })).json()
+    assert.equal(threadDetail.generations.length, 2)
+    assert.equal(threadDetail.generations[0].prompt, 'Test direct BytePlus text output.')
+    assert.equal(threadDetail.generations[1].prompt, 'A follow up in the same thread.')
+
+    // The follow-up above was sent into an existing thread, so the provider should
+    // have received the earlier exchange ahead of it.
+    const contextBody = bytePlusTextBodies.at(-1)
+    assert.deepEqual(contextBody.messages, [
+      { role: 'user', content: 'Test direct BytePlus text output.' },
+      { role: 'assistant', content: 'BytePlus chat response' },
+      { role: 'user', content: 'A follow up in the same thread.' },
+    ])
+
+    await fetch(baseUrl + '/v1/admin/models/' + bytePlusTextModel.model.id, {
+      method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ contextTurns: 0 }),
+    })
+    await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: bytePlusTextModel.model.id, prompt: 'No context please.', sessionId: glmThread.id }),
+    })
+    assert.deepEqual(bytePlusTextBodies.at(-1).messages, [{ role: 'user', content: 'No context please.' }],
+      'contextTurns 0 sends the prompt alone')
+
+    const rejectedTurns = await fetch(baseUrl + '/v1/admin/models/' + bytePlusTextModel.model.id, {
+      method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ contextTurns: 999 }),
+    })
+    assert.equal(rejectedTurns.status, 400)
+
+    const renamed = await fetch(baseUrl + '/v1/sessions/' + glmThread.id, {
+      method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Timeout debugging' }),
+    })
+    assert.equal((await renamed.json()).session.title, 'Timeout debugging')
+
+    const wrongModelThread = await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: createdModel.model.id, prompt: 'Wrong model for this thread.', sessionId: glmThread.id }),
+    })
+    assert.equal(wrongModelThread.status, 400, 'a thread refuses generations from another model')
+
+    const archived = await fetch(baseUrl + '/v1/sessions/' + glmThread.id, { method: 'DELETE', headers })
+    assert.equal(archived.status, 200)
+    const afterArchive = await (await fetch(baseUrl + '/v1/sessions', { headers })).json()
+    assert.equal(afterArchive.sessions.some(item => item.id === glmThread.id), false)
+
+    const rejectedSetting = await fetch(baseUrl + '/v1/admin/models', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Bad Setting', provider: 'BytePlus', kind: 'text', endpoint: 'x', priceUsd: 0, thinkingMode: 'maybe' }),
+    })
+    assert.equal(rejectedSetting.status, 400)
     assert.equal(bytePlusText.generation.modelProvider, 'BytePlus')
     const bytePlusVideoModelResponse = await fetch(baseUrl + '/v1/admin/models', {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
@@ -222,7 +332,7 @@ test('login, authorization, and usage summary', async () => {
     const usageResponse = await fetch(baseUrl + '/v1/usage/summary', { headers })
     const usage = await usageResponse.json()
     assert.equal(usageResponse.status, 200)
-    assert.equal(usage.byModel.length, 8)
+    assert.equal(usage.byModel.length, 9)
 
     const queueResponse = await fetch(baseUrl + '/v1/generations', {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' },

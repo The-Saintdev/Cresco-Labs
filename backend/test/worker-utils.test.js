@@ -57,3 +57,99 @@ test('worker extracts safe text output from provider responses', () => {
   assert.equal(__test.providerOutputText({ output: [{ content: [{ type: 'output_text', text: 'Nested response' }] }] }), 'Nested response')
   assert.equal(__test.providerOutputText({}), null)
 })
+
+test('worker reads chat completion output', () => {
+  assert.equal(__test.providerOutputText({ choices: [{ message: { role: 'assistant', content: 'Chat response' } }] }), 'Chat response')
+  assert.equal(__test.providerOutputText({ choices: [{ message: { content: [{ text: 'Part one. ' }, { text: 'Part two.' }] } }] }), 'Part one. Part two.')
+  assert.equal(__test.providerOutputText({ choices: [{ message: { content: '' } }] }), null)
+})
+
+test('worker gives text generations a longer timeout than polls', () => {
+  assert.equal(__test.providerTimeoutMs({}, 'text'), 120000)
+  assert.equal(__test.providerTimeoutMs({}, 'text', true), 300000)
+  assert.equal(__test.providerTimeoutMs({}, 'video'), 20000)
+  assert.equal(__test.providerTimeoutMs({}, 'poll'), 20000)
+  assert.equal(__test.providerTimeoutMs({ CRESCO_TEXT_TIMEOUT_MS: '45000' }, 'text'), 45000)
+  assert.equal(__test.providerTimeoutMs({ CRESCO_TEXT_TIMEOUT_MS: 'nonsense' }, 'text'), 120000)
+})
+
+test('worker builds chat completion bodies with reasoning disabled by default', () => {
+  const model = { endpoint: 'glm-5.3-flash' }
+  assert.equal(__test.textRequestPath(model), '/chat/completions')
+  const body = __test.textRequestBody(model, 'Say hello')
+  assert.deepEqual(body.messages, [{ role: 'user', content: 'Say hello' }])
+  assert.deepEqual(body.thinking, { type: 'disabled' })
+  assert.equal(body.stream, undefined)
+  const streamed = __test.textRequestBody(model, 'Say hello', { stream: true })
+  assert.equal(streamed.stream, true)
+  assert.deepEqual(streamed.stream_options, { include_usage: true })
+})
+
+test('worker honours per-model reasoning and endpoint settings', () => {
+  const responsesModel = { endpoint: 'glm-5.3-flash', textApi: 'responses', thinkingMode: 'enabled' }
+  assert.equal(__test.textRequestPath(responsesModel), '/responses')
+  const body = __test.textRequestBody(responsesModel, 'Say hello')
+  assert.deepEqual(body.input, [{ role: 'user', content: 'Say hello' }])
+  assert.deepEqual(body.thinking, { type: 'enabled' })
+  assert.equal(__test.textRequestBody({ endpoint: 'x', thinkingMode: 'auto' }, 'hi').thinking, undefined)
+})
+
+test('worker reads streamed deltas from both text APIs', () => {
+  assert.equal(__test.streamTextDelta({ choices: [{ delta: { content: 'Hel' } }] }), 'Hel')
+  assert.equal(__test.streamTextDelta({ choices: [{ delta: { content: [{ text: 'lo' }] } }] }), 'lo')
+  assert.equal(__test.streamTextDelta({ type: 'response.output_text.delta', delta: '!' }), '!')
+  assert.equal(__test.streamTextDelta({ choices: [{ delta: { reasoning_content: 'thinking' } }] }), '')
+})
+
+test('worker turns provider timeouts into a readable code and keeps the raw text', () => {
+  const aborted = new Error('The operation was aborted due to timeout')
+  aborted.name = 'TimeoutError'
+  assert.equal(__test.isTimeoutError(aborted), true)
+  const mapped = __test.providerFailure(aborted, 120000)
+  assert.equal(mapped.message, 'provider_timeout_after_120s')
+  assert.equal(mapped.providerDetail, 'The operation was aborted due to timeout')
+  const other = new Error('byteplus_request_failed_404')
+  assert.equal(__test.isTimeoutError(other), false)
+  assert.equal(__test.providerFailure(other, 120000).message, 'byteplus_request_failed_404')
+})
+
+test('worker caps how long a generation may stay queued', () => {
+  assert.equal(__test.maxQueuedMs({}, 'text'), 600000)
+  assert.equal(__test.maxQueuedMs({}, 'image'), 1200000)
+  assert.equal(__test.maxQueuedMs({}, 'video'), 3600000)
+  assert.equal(__test.maxQueuedMs({ CRESCO_MAX_QUEUED_MINUTES: '5' }, 'video'), 300000)
+  assert.equal(__test.maxQueuedMs({}, 'unknown-kind'), 1800000)
+})
+
+test('worker carries thread history into the request body', () => {
+  const model = { endpoint: 'glm-5.3-flash', contextTurns: 8 }
+  const history = [
+    { role: 'user', content: 'First question' },
+    { role: 'assistant', content: 'First answer' },
+  ]
+  const body = __test.textRequestBody(model, 'Follow up', { history })
+  assert.deepEqual(body.messages, [...history, { role: 'user', content: 'Follow up' }])
+
+  const responsesBody = __test.textRequestBody({ ...model, textApi: 'responses' }, 'Follow up', { history })
+  assert.equal(responsesBody.input.length, 3)
+  assert.equal(responsesBody.input[2].content, 'Follow up')
+})
+
+test('worker bounds how much thread history is resent', () => {
+  assert.equal(__test.contextTurns({ contextTurns: 8 }), 8)
+  assert.equal(__test.contextTurns({ contextTurns: 0 }), 0)
+  assert.equal(__test.contextTurns({}), 0)
+  assert.equal(__test.contextTurns({ contextTurns: -3 }), 0)
+  assert.equal(__test.contextTurns({ contextTurns: 500 }), 50)
+
+  // The newest messages survive when the character budget is exceeded.
+  const long = Array.from({ length: 6 }, (_value, index) => ({ role: 'user', content: 'x'.repeat(5000) + String(index) }))
+  const trimmed = __test.trimContext(long)
+  assert.ok(trimmed.length < long.length)
+  assert.equal(trimmed.at(-1), long.at(-1))
+  assert.ok(trimmed.reduce((sum, message) => sum + message.content.length, 0) <= 24000)
+
+  // A single oversized message is never dropped to nothing.
+  const huge = [{ role: 'user', content: 'y'.repeat(40000) }]
+  assert.equal(__test.trimContext(huge).length, 1)
+})

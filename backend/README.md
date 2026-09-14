@@ -63,3 +63,63 @@ A model is executable only when it is published, has an endpoint, has an encrypt
 The backend checks the configured per-generation and monthly workspace limits before dispatch. Queued requests reserve their catalog estimate; completed requests use their recorded cost. A zero limit means no hard cap.
 
 The local JSON and upload adapters are development-only. The free hosted schema is in `db/d1`; the optional PostgreSQL contract in `db/001_initial.sql` is retained only for a future migration.
+
+## Text model latency
+
+Text generations are dispatched synchronously against the provider; only video tasks use the queue. Two model settings and three environment variables control how long that call may take.
+
+Per-model, set from the admin app when the model kind is Text:
+
+- `thinkingMode` — `disabled` (default), `enabled`, or `auto`. A reasoning pass is the usual reason a flash-class model exceeds its request timeout, and it is billed. `auto` sends no field and leaves the decision to the provider.
+- `contextTurns` — how many earlier exchanges in a chat are resent with each
+  message. Default `8`, `0` disables it, `50` is the ceiling. Only completed
+  turns that produced text are carried, oldest first, and the history is also
+  capped at 24,000 characters so a long thread trims from the front rather than
+  growing without limit. Every carried turn is re-sent and re-billed on each
+  message, which is why this is a per-model setting rather than a constant.
+- `textApi` — `chat_completions` (default) or `responses`. Both are supported so the two endpoints can be compared for latency on the same model without a redeploy.
+
+Per environment:
+
+- `CRESCO_PROVIDER_TIMEOUT_MS` — non-text dispatch and all status polls. Default `20000`.
+- `CRESCO_TEXT_TIMEOUT_MS` — non-streaming text dispatch. Default `120000`.
+- `CRESCO_TEXT_STREAM_TIMEOUT_MS` — total lifetime of a streamed text response. Default `300000`.
+
+`POST /v1/generations` with `"stream": true` on a text model returns `text/event-stream` with `meta`, `delta`, `done` and `error` events instead of a JSON record. The generation row is finalised before the stream closes, so a reload shows the same result. Members see output at first token rather than after the full completion.
+
+## Diagnosing a provider failure
+
+Every provider call logs one structured line — `{"event":"provider_call","provider":…,"kind":…,"path":…,"status":…,"durationMs":…}` — with no prompt, result or credential in it. Read it with `wrangler tail` or the local API's stdout.
+
+Each generation also records `providerLatencyMs`. A failed generation keeps two separate fields: `error` is a stable code shown to members (for example `provider_timeout_after_120s`), while `lastProviderError` holds the raw provider or runtime text and is never returned to a client — read it from D1 when a code alone is not enough.
+
+To isolate whether a slow text model is the provider or Cresco, call the provider directly with the same endpoint ID and compare:
+
+```bash
+time curl -sS -X POST "$CRESCO_BYTEPLUS_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $ARK_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"<endpoint-id>","messages":[{"role":"user","content":"hi"}],
+       "thinking":{"type":"disabled"},"max_tokens":64}'
+```
+
+## How async jobs advance (Cloudflare free plan)
+
+Cloudflare Queues requires the paid Workers plan, so the Worker does not use it and
+`wrangler.jsonc` declares no queue. A declared queue *consumer* makes `wrangler deploy`
+fail outright on the free plan, which is worth checking first if a deploy has been
+silently failing.
+
+Text is synchronous and needs none of this. Image and video on fal.ai are submitted,
+then polled. Three things advance a polled job, in order of how quickly a member sees it:
+
+1. **The reader's own request.** `GET /v1/generations/:id` and `GET /v1/history` poll the
+   provider for any queued generation they return, at most once every two seconds per
+   generation and at most three per history read. This is what makes a result appear
+   within seconds of the provider finishing.
+2. **The five-minute cron.** The safety net for jobs whose page nobody has open. It
+   processes directly anything untouched for two minutes.
+3. **The per-kind ceiling.** A generation queued past its limit is failed as
+   `generation_expired_after_Nm` rather than left running forever.
+
+`GENERATION_QUEUE` is still honoured if a binding is ever added, so moving to the paid
+plan needs only the config back — no code change.

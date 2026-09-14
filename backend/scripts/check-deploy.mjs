@@ -7,6 +7,9 @@ const configPath = resolve(backendRoot, 'wrangler.jsonc')
 const migrationPaths = [
   resolve(backendRoot, 'db/d1/0001_initial.sql'),
   resolve(backendRoot, 'db/d1/0002_provider_usage.sql'),
+  resolve(backendRoot, 'db/d1/0003_text_dispatch.sql'),
+  resolve(backendRoot, 'db/d1/0004_sessions.sql'),
+  resolve(backendRoot, 'db/d1/0005_thread_context.sql'),
 ]
 const workerPath = resolve(backendRoot, 'src/worker.js')
 const failures = []

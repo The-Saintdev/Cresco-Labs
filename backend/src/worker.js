@@ -136,6 +136,137 @@ function providerKey(provider) {
   return value
 }
 
+const DEFAULT_PROVIDER_TIMEOUT_MS = 20000
+const DEFAULT_TEXT_TIMEOUT_MS = 120000
+const DEFAULT_TEXT_STREAM_TIMEOUT_MS = 300000
+const THINKING_MODES = ['disabled', 'enabled', 'auto']
+const TEXT_APIS = ['chat_completions', 'responses']
+
+function positiveInt(value, fallback) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback
+}
+
+function providerTimeoutMs(env, kind, streaming = false) {
+  if (kind !== 'text') return positiveInt(env.CRESCO_PROVIDER_TIMEOUT_MS, DEFAULT_PROVIDER_TIMEOUT_MS)
+  if (streaming) return positiveInt(env.CRESCO_TEXT_STREAM_TIMEOUT_MS, DEFAULT_TEXT_STREAM_TIMEOUT_MS)
+  return positiveInt(env.CRESCO_TEXT_TIMEOUT_MS, DEFAULT_TEXT_TIMEOUT_MS)
+}
+
+const DEFAULT_MAX_QUEUED_MINUTES = { text: 10, image: 20, video: 60 }
+// A job the cron has been re-picking for this long is not going to finish. It is
+// failed with a reason rather than left showing "Processing" forever.
+function maxQueuedMs(env, kind) {
+  const override = positiveInt(env.CRESCO_MAX_QUEUED_MINUTES, 0)
+  const minutes = override || DEFAULT_MAX_QUEUED_MINUTES[kind] || 30
+  return minutes * 60000
+}
+
+// The cron is the safety net behind the queue. A row nothing has touched for this
+// long is processed directly, so a missing or broken queue consumer cannot strand it.
+const STALE_QUEUED_MS = 120000
+
+// Cloudflare Queues is a paid-plan feature, so on the free plan the only things
+// that can advance an async job are the five-minute cron and the reader's own
+// poll. Five minutes is far too slow to watch a result arrive, so reads advance
+// the job themselves, no faster than this interval per generation.
+const MIN_ADVANCE_MS = 2000
+const MAX_ADVANCE_PER_READ = 3
+
+function readyToAdvance(generation) {
+  if (generation.status !== 'queued') return false
+  const marker = generation.lastProviderAttemptAt || generation.dispatchedAt || generation.createdAt
+  const parsed = Date.parse(marker)
+  return !Number.isFinite(parsed) || Date.now() - parsed >= MIN_ADVANCE_MS
+}
+
+function requestPath(url) {
+  try {
+    return new URL(url).pathname
+  } catch {
+    return 'unknown'
+  }
+}
+
+// Prompts, results and credentials are never logged: only routing and timing.
+function logProviderCall(details) {
+  console.log(JSON.stringify({ event: 'provider_call', ...details }))
+}
+
+function isTimeoutError(error) {
+  const name = String(error?.name || '')
+  return name === 'TimeoutError' || name === 'AbortError' || /aborted due to timeout/i.test(String(error?.message || ''))
+}
+
+// Members should never see a raw DOMException. The original text is kept on the
+// generation as last_provider_error so the cause stays diagnosable.
+function providerFailure(error, timeoutMs) {
+  const detail = error instanceof Error ? error.message : String(error)
+  const failure = isTimeoutError(error)
+    ? new Error(`provider_timeout_after_${Math.round(timeoutMs / 1000)}s`)
+    : new Error(detail || 'provider_request_failed')
+  failure.providerDetail = detail
+  return failure
+}
+
+function providerDetail(error) {
+  if (error?.providerDetail) return String(error.providerDetail)
+  return error instanceof Error ? error.message : 'provider_request_failed'
+}
+
+function thinkingMode(model) {
+  return THINKING_MODES.includes(model?.thinkingMode) ? model.thinkingMode : 'disabled'
+}
+
+function textApi(model) {
+  return TEXT_APIS.includes(model?.textApi) ? model.textApi : 'chat_completions'
+}
+
+function textRequestPath(model) {
+  return textApi(model) === 'responses' ? '/responses' : '/chat/completions'
+}
+
+const MAX_CONTEXT_TURNS = 50
+// Every carried turn is re-sent and re-billed on each message, so the history is
+// capped by turn count and by total characters.
+const MAX_CONTEXT_CHARS = 24000
+
+function contextTurns(model) {
+  const value = Number(model?.contextTurns)
+  if (!Number.isFinite(value) || value < 0) return 0
+  return Math.min(Math.floor(value), MAX_CONTEXT_TURNS)
+}
+
+// Oldest first, trimmed from the front once the character budget is spent, so the
+// most recent exchanges always survive.
+function trimContext(messages) {
+  let total = messages.reduce((sum, message) => sum + message.content.length, 0)
+  let start = 0
+  while (total > MAX_CONTEXT_CHARS && start < messages.length - 1) {
+    total -= messages[start].content.length
+    start += 1
+  }
+  return messages.slice(start)
+}
+
+// 'auto' leaves the decision to the provider default; anything else is explicit,
+// and 'disabled' is the default because a reasoning pass is the main reason a
+// flash-class model takes longer than the request timeout.
+function textRequestBody(model, prompt, { stream = false, history = [] } = {}) {
+  const mode = thinkingMode(model)
+  const thinking = mode === 'auto' ? {} : { thinking: { type: mode } }
+  const messages = trimContext([...history, { role: 'user', content: prompt }])
+  if (textApi(model) === 'responses') {
+    return { model: model.endpoint, input: messages, ...thinking, ...(stream ? { stream: true } : {}) }
+  }
+  return {
+    model: model.endpoint,
+    messages,
+    ...thinking,
+    ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}),
+  }
+}
+
 function userFromRow(row) {
   if (!row) return null
   return {
@@ -167,9 +298,58 @@ function modelFromRow(row) {
     endpoint: row.endpoint,
     status: row.status,
     priceNanoUsd: Number(row.price_nano_usd || 0),
+    thinkingMode: THINKING_MODES.includes(row.thinking_mode) ? row.thinking_mode : 'disabled',
+    textApi: TEXT_APIS.includes(row.text_api) ? row.text_api : 'chat_completions',
+    contextTurns: row.context_turns === null || row.context_turns === undefined ? 8 : Number(row.context_turns),
     createdAt: row.created_at,
     archivedAt: row.archived_at,
   }
+}
+
+function sessionFromRow(row) {
+  if (!row) return null
+  return {
+    id: row.id,
+    userId: row.user_id,
+    modelId: row.model_id,
+    title: row.title,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    archivedAt: row.archived_at,
+  }
+}
+
+function safeSession(session, extra = {}) {
+  if (!session) return null
+  const { userId: _userId, archivedAt: _archivedAt, ...safe } = session
+  return { ...safe, ...extra }
+}
+
+// A thread is named after whatever started it, the way a chat client does.
+function sessionTitleFrom(prompt) {
+  const cleaned = String(prompt || '').replace(/\s+/g, ' ').trim()
+  if (!cleaned) return 'New chat'
+  return cleaned.length > 60 ? `${cleaned.slice(0, 57)}…` : cleaned
+}
+
+async function sessionFor(env, user, model, sessionId, prompt) {
+  if (sessionId) {
+    const existing = sessionFromRow(await first(env,
+      'SELECT * FROM generation_sessions WHERE id = ? AND workspace_id = ? AND archived_at IS NULL', String(sessionId), WORKSPACE_ID))
+    if (!existing || existing.userId !== user.id) throw new ApiError(404, 'session_not_found')
+    if (existing.modelId !== model.id) throw new ApiError(400, 'session_model_mismatch')
+    return existing
+  }
+  const id = crypto.randomUUID()
+  const timestamp = nowIso()
+  await run(env, `INSERT INTO generation_sessions (id, workspace_id, user_id, model_id, title, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`, id, WORKSPACE_ID, user.id, model.id, sessionTitleFrom(prompt), timestamp, timestamp)
+  return { id, userId: user.id, modelId: model.id, title: sessionTitleFrom(prompt), createdAt: timestamp, updatedAt: timestamp, archivedAt: null }
+}
+
+async function touchSession(env, sessionId) {
+  if (!sessionId) return
+  await run(env, 'UPDATE generation_sessions SET updated_at = ? WHERE id = ? AND workspace_id = ?', nowIso(), sessionId, WORKSPACE_ID)
 }
 
 function uploadFromRow(row) {
@@ -217,6 +397,8 @@ function generationFromRow(row) {
     lastProviderError: row.last_provider_error,
     lastProviderAttemptAt: row.last_provider_attempt_at,
     pollAttempts: Number(row.poll_attempts || 0),
+    providerLatencyMs: row.provider_latency_ms === null || row.provider_latency_ms === undefined ? null : Number(row.provider_latency_ms),
+    sessionId: row.session_id || null,
     createdAt: row.created_at,
     dispatchedAt: row.dispatched_at,
     completedAt: row.completed_at,
@@ -236,7 +418,13 @@ function safeGeneration(generation) {
     lastProviderAttemptAt: _lastProviderAttemptAt,
     ...safe
   } = generation
-  return { ...safe, outputText: providerOutputText(generation.result), references: (generation.references || []).map(safeUpload) }
+  const queuedForMs = generation.status === 'queued' ? Date.now() - Date.parse(generation.createdAt) : null
+  return {
+    ...safe,
+    outputText: providerOutputText(generation.result),
+    queuedForMs: Number.isFinite(queuedForMs) ? queuedForMs : null,
+    references: (generation.references || []).map(safeUpload),
+  }
 }
 
 function allowedOrigin(request, env) {
@@ -295,6 +483,12 @@ function providerOutputText(data) {
   if (typeof data.output_text === 'string') return data.output_text
   if (typeof data.output === 'string') return data.output
   if (typeof data.text === 'string') return data.text
+  const message = data?.choices?.[0]?.message
+  if (typeof message?.content === 'string' && message.content) return message.content
+  if (Array.isArray(message?.content)) {
+    const joined = message.content.map(part => (typeof part?.text === 'string' ? part.text : '')).join('')
+    if (joined) return joined
+  }
   for (const item of Array.isArray(data.output) ? data.output : []) {
     for (const content of Array.isArray(item?.content) ? item.content : []) {
       if (typeof content?.text === 'string') return content.text
@@ -423,7 +617,18 @@ async function historyPage(env, user, url) {
   bindings.push(limit + 1)
   const rows = await all(env, `SELECT * FROM generations WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ?`, ...bindings)
   const hasMore = rows.length > limit
-  const page = rows.slice(0, limit).map(generationFromRow)
+  let page = rows.slice(0, limit).map(generationFromRow)
+  // Without a queue, a member watching this list is what moves their jobs along.
+  // Bounded so one read can never fan out into an unbounded set of provider calls.
+  const advancing = page.filter(readyToAdvance).slice(0, MAX_ADVANCE_PER_READ)
+  if (advancing.length) {
+    await Promise.all(advancing.map(item =>
+      processGeneration(env, item.id).catch(error => console.error('advance_failed', item.id, error))))
+    const refreshed = await all(env, `SELECT * FROM generations WHERE workspace_id = ? AND id IN (${advancing.map(() => '?').join(',')})`,
+      WORKSPACE_ID, ...advancing.map(item => item.id))
+    const byId = new Map(refreshed.map(row => [row.id, generationFromRow(row)]))
+    page = page.map(item => byId.get(item.id) || item)
+  }
   await attachReferences(env, page)
   return { generations: page.map(safeGeneration), nextCursor: hasMore ? page.at(-1)?.id || null : null }
 }
@@ -546,12 +751,21 @@ async function falInput(generation, user, env) {
 }
 
 async function falRequest(url, credential, env, init = {}) {
-  const response = await fetch(url, {
-    ...init,
-    headers: { authorization: `Key ${await decryptSecret(credential.encrypted_api_key, env)}`, 'content-type': 'application/json', ...(init.headers || {}) },
-    signal: AbortSignal.timeout(20000),
-  })
+  const { timeoutMs = providerTimeoutMs(env), kind = null, ...rest } = init
+  const startedAt = Date.now()
+  let response
+  try {
+    response = await fetch(url, {
+      ...rest,
+      headers: { authorization: `Key ${await decryptSecret(credential.encrypted_api_key, env)}`, 'content-type': 'application/json', ...(rest.headers || {}) },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (error) {
+    logProviderCall({ provider: 'fal.ai', kind, path: requestPath(url), ok: false, durationMs: Date.now() - startedAt, timeoutMs, error: String(error?.name || 'FetchError') })
+    throw providerFailure(error, timeoutMs)
+  }
   const data = await response.json().catch(() => ({}))
+  logProviderCall({ provider: 'fal.ai', kind, path: requestPath(url), ok: response.ok, status: response.status, durationMs: Date.now() - startedAt })
   if (!response.ok) throw new Error(data.detail || data.message || `fal_request_failed_${response.status}`)
   return data
 }
@@ -668,12 +882,21 @@ function bytePlusBase(env) {
 }
 
 async function bytePlusRequest(url, credential, env, init = {}) {
-  const response = await fetch(url, {
-    ...init,
-    headers: { authorization: `Bearer ${await decryptSecret(credential.encrypted_api_key, env)}`, 'content-type': 'application/json', ...(init.headers || {}) },
-    signal: AbortSignal.timeout(20000),
-  })
+  const { timeoutMs = providerTimeoutMs(env), kind = null, ...rest } = init
+  const startedAt = Date.now()
+  let response
+  try {
+    response = await fetch(url, {
+      ...rest,
+      headers: { authorization: `Bearer ${await decryptSecret(credential.encrypted_api_key, env)}`, 'content-type': 'application/json', ...(rest.headers || {}) },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (error) {
+    logProviderCall({ provider: 'byteplus', kind, path: requestPath(url), ok: false, durationMs: Date.now() - startedAt, timeoutMs, error: String(error?.name || 'FetchError') })
+    throw providerFailure(error, timeoutMs)
+  }
   const data = await response.json().catch(() => ({}))
+  logProviderCall({ provider: 'byteplus', kind, path: requestPath(url), ok: response.ok, status: response.status, durationMs: Date.now() - startedAt })
   if (!response.ok) throw new Error(data?.error?.message || data?.message || `byteplus_request_failed_${response.status}`)
   return data
 }
@@ -691,9 +914,12 @@ async function bytePlusReferences(generation, env) {
 
 async function dispatchBytePlusGeneration(env, generation, model, credential) {
   const base = bytePlusBase(env)
+  const timeoutMs = providerTimeoutMs(env, model.kind)
   if (model.kind === 'text') {
-    const result = await bytePlusRequest(`${base}/responses`, credential, env, {
-      method: 'POST', body: JSON.stringify({ model: model.endpoint, input: generation.prompt }),
+    const history = await threadContext(env, generation, model)
+    const result = await bytePlusRequest(`${base}${textRequestPath(model)}`, credential, env, {
+      method: 'POST', kind: model.kind, timeoutMs,
+      body: JSON.stringify(textRequestBody(model, generation.prompt, { history })),
     })
     return { asynchronous: false, result, requestId: result.id || null }
   }
@@ -708,7 +934,7 @@ async function dispatchBytePlusGeneration(env, generation, model, credential) {
       ...(generation.options?.quality === 'High' ? { size: '2K' } : {}),
       ...(images.length ? { image: images.length === 1 ? images[0] : images } : {}),
     }
-    const result = await bytePlusRequest(`${base}/images/generations`, credential, env, { method: 'POST', body: JSON.stringify(body) })
+    const result = await bytePlusRequest(`${base}/images/generations`, credential, env, { method: 'POST', kind: model.kind, timeoutMs, body: JSON.stringify(body) })
     return { asynchronous: false, result, requestId: result.id || null }
   }
   const body = {
@@ -719,10 +945,158 @@ async function dispatchBytePlusGeneration(env, generation, model, credential) {
     ...(generation.options?.quality ? { resolution: generation.options.quality } : {}),
     ...(generation.options?.duration ? { duration: Number(String(generation.options.duration).replace(/\D/g, '')) || undefined } : {}),
   }
-  const result = await bytePlusRequest(`${base}/contents/generations/tasks`, credential, env, { method: 'POST', body: JSON.stringify(body) })
+  const result = await bytePlusRequest(`${base}/contents/generations/tasks`, credential, env, { method: 'POST', kind: model.kind, timeoutMs, body: JSON.stringify(body) })
   if (!result.id) throw new Error('byteplus_task_id_missing')
   const statusUrl = `${base}/contents/generations/tasks/${encodeURIComponent(result.id)}`
   return { asynchronous: true, result, requestId: result.id, statusUrl }
+}
+
+function sseFrame(event, data) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+}
+
+// Chat-completions chunks carry choices[].delta.content; the responses API emits
+// typed output_text deltas. Both normalise to a plain string here.
+function streamTextDelta(payload) {
+  const delta = payload?.choices?.[0]?.delta
+  if (typeof delta?.content === 'string') return delta.content
+  if (Array.isArray(delta?.content)) return delta.content.map(part => (typeof part?.text === 'string' ? part.text : '')).join('')
+  if (payload?.type === 'response.output_text.delta' && typeof payload.delta === 'string') return payload.delta
+  return ''
+}
+
+async function* bytePlusTextStream(env, prompt, model, credential, history = []) {
+  const url = `${bytePlusBase(env)}${textRequestPath(model)}`
+  const timeoutMs = providerTimeoutMs(env, 'text', true)
+  const startedAt = Date.now()
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${await decryptSecret(credential.encrypted_api_key, env)}`,
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify(textRequestBody(model, prompt, { stream: true, history })),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (error) {
+    logProviderCall({ provider: 'byteplus', kind: 'text', path: requestPath(url), stream: true, ok: false, durationMs: Date.now() - startedAt, timeoutMs, error: String(error?.name || 'FetchError') })
+    throw providerFailure(error, timeoutMs)
+  }
+  if (!response.ok || !response.body) {
+    const data = await response.json().catch(() => ({}))
+    logProviderCall({ provider: 'byteplus', kind: 'text', path: requestPath(url), stream: true, ok: false, status: response.status, durationMs: Date.now() - startedAt })
+    throw new Error(data?.error?.message || data?.message || `byteplus_request_failed_${response.status}`)
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let firstDeltaMs = null
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let index = buffer.indexOf('\n')
+      while (index >= 0) {
+        const line = buffer.slice(0, index).trim()
+        buffer = buffer.slice(index + 1)
+        index = buffer.indexOf('\n')
+        if (!line.startsWith('data:')) continue
+        const raw = line.slice(5).trim()
+        if (!raw || raw === '[DONE]') continue
+        let payload
+        try {
+          payload = JSON.parse(raw)
+        } catch {
+          continue
+        }
+        const text = streamTextDelta(payload)
+        if (text && firstDeltaMs === null) firstDeltaMs = Date.now() - startedAt
+        yield { delta: text, requestId: payload?.id || null, usage: payload?.usage || null }
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {})
+    logProviderCall({ provider: 'byteplus', kind: 'text', path: requestPath(url), stream: true, ok: true, status: response.status, firstDeltaMs, durationMs: Date.now() - startedAt })
+  }
+}
+
+// Streaming keeps the member-visible wait at time-to-first-token instead of the
+// full completion. The generation row is finalised before the stream closes so a
+// reload shows the same result the stream delivered.
+function streamTextGeneration(env, ctx, { generation, model, credential, origin, session }) {
+  const encoder = new TextEncoder()
+  const { readable, writable } = new TransformStream()
+  const writer = writable.getWriter()
+  const send = (event, data) => writer.write(encoder.encode(sseFrame(event, data)))
+
+  const work = async () => {
+    const startedAt = Date.now()
+    let text = ''
+    let usage = null
+    let requestId = null
+    try {
+      await send('meta', { generation: safeGeneration(generation), session: safeSession(session) })
+      await run(env, `UPDATE generations SET provider_state = 'streaming', dispatched_at = ? WHERE id = ?`, nowIso(), generation.id)
+      const history = await threadContext(env, generation, model)
+      for await (const chunk of bytePlusTextStream(env, generation.prompt, model, credential, history)) {
+        if (chunk.requestId) requestId = chunk.requestId
+        if (chunk.usage) usage = chunk.usage
+        if (!chunk.delta) continue
+        text += chunk.delta
+        await send('delta', { text: chunk.delta })
+      }
+      if (!text) throw new Error('provider_empty_response')
+      const result = {
+        id: requestId,
+        object: 'chat.completion',
+        choices: [{ index: 0, message: { role: 'assistant', content: text } }],
+        ...(usage ? { usage } : {}),
+      }
+      await run(env, `UPDATE generations SET status = 'complete', provider_request_id = ?, provider_state = 'succeeded', result_json = ?,
+        cost_nano_usd = estimated_cost_nano_usd, cost_source = CASE WHEN estimated_cost_nano_usd > 0 THEN 'catalog_estimate' ELSE 'pending_reconciliation' END,
+        completed_at = ?, provider_latency_ms = ?, last_provider_error = NULL WHERE id = ?`,
+        requestId, JSON.stringify(result), nowIso(), Date.now() - startedAt, generation.id)
+      const final = generationFromRow(await first(env, 'SELECT * FROM generations WHERE id = ? AND workspace_id = ?', generation.id, WORKSPACE_ID))
+      await attachReferences(env, [final])
+      await send('done', { generation: safeGeneration(final) })
+    } catch (error) {
+      const message = error instanceof Error ? error.message.slice(0, 500) : 'provider_stream_failed'
+      await run(env, `UPDATE generations SET status = 'failed', provider_state = 'stream_failed', error = ?, last_provider_error = ?,
+        completed_at = ?, provider_latency_ms = ? WHERE id = ?`,
+        message, providerDetail(error).slice(0, 500), nowIso(), Date.now() - startedAt, generation.id)
+      await send('error', { error: message }).catch(() => {})
+    } finally {
+      await writer.close().catch(() => {})
+    }
+  }
+
+  ctx.waitUntil(work())
+  return new Response(readable, {
+    status: 200,
+    headers: responseHeaders(origin, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' }),
+  })
+}
+
+// Earlier turns of the same thread, as alternating user/assistant messages. Only
+// completed turns that actually produced text are carried.
+async function threadContext(env, generation, model) {
+  const turns = contextTurns(model)
+  if (!turns || model.kind !== 'text' || !generation.sessionId) return []
+  const rows = await all(env, `SELECT prompt, result_json FROM generations
+    WHERE session_id = ? AND workspace_id = ? AND id != ? AND status = 'complete'
+    ORDER BY created_at DESC LIMIT ?`, generation.sessionId, WORKSPACE_ID, generation.id, turns)
+  const messages = []
+  for (const row of rows.reverse()) {
+    const answer = providerOutputText(parseJson(row.result_json, null))
+    if (!row.prompt || !answer) continue
+    messages.push({ role: 'user', content: String(row.prompt) })
+    messages.push({ role: 'assistant', content: String(answer) })
+  }
+  return messages
 }
 
 async function generationContext(env, id) {
@@ -744,11 +1118,13 @@ async function dispatchGeneration(env, context) {
       credential ? 'adapter_required' : 'credential_required', credential ? 'provider_adapter_required' : 'provider_credential_required', nowIso(), generation.id)
     return { done: true }
   }
+  const startedAt = Date.now()
   try {
     if (provider === 'fal.ai') {
       const queueBase = String(env.CRESCO_FAL_QUEUE_URL || 'https://queue.fal.run').replace(/\/$/, '')
       const data = await falRequest(`${queueBase}/${model.endpoint.replace(/^\/+/, '')}`, credential, env, {
         method: 'POST',
+        kind: model.kind,
         body: JSON.stringify(await falInput(generation, user, env)),
       })
       await run(env, `UPDATE generations SET provider_request_id = ?, provider_status_url = ?, provider_response_url = ?,
@@ -769,22 +1145,31 @@ async function dispatchGeneration(env, context) {
     }
     await run(env, `UPDATE generations SET status = 'complete', provider_request_id = ?, provider_state = 'succeeded', result_json = ?, result_url = ?,
       cost_nano_usd = estimated_cost_nano_usd, cost_source = CASE WHEN estimated_cost_nano_usd > 0 THEN 'catalog_estimate' ELSE 'pending_reconciliation' END,
-      dispatched_at = ?, completed_at = ?, last_provider_error = NULL WHERE id = ?`,
-      dispatched.requestId, JSON.stringify(dispatched.result), resultUrl(dispatched.result), nowIso(), nowIso(), generation.id)
+      dispatched_at = ?, completed_at = ?, provider_latency_ms = ?, last_provider_error = NULL WHERE id = ?`,
+      dispatched.requestId, JSON.stringify(dispatched.result), resultUrl(dispatched.result), nowIso(), nowIso(), Date.now() - startedAt, generation.id)
     return { done: true }
   } catch (error) {
-    await run(env, `UPDATE generations SET status = 'failed', provider_state = 'submission_failed', error = ?, completed_at = ? WHERE id = ?`,
-      error instanceof Error ? error.message.slice(0, 500) : 'provider_submission_failed', nowIso(), generation.id)
+    await run(env, `UPDATE generations SET status = 'failed', provider_state = 'submission_failed', error = ?, last_provider_error = ?,
+      completed_at = ?, provider_latency_ms = ? WHERE id = ?`,
+      error instanceof Error ? error.message.slice(0, 500) : 'provider_submission_failed',
+      providerDetail(error).slice(0, 500), nowIso(), Date.now() - startedAt, generation.id)
     return { done: true }
   }
 }
 
 async function reconcileGeneration(env, context) {
   const { generation, model, credential } = context
-  if (!model || !credential || !generation.providerStatusUrl || !generation.providerResponseUrl) return { done: true }
+  // Without a model, a credential or poll URLs there is nothing left to poll, and
+  // returning quietly would leave the row queued forever. Fail it with a reason.
+  if (!model || !credential || !generation.providerStatusUrl || !generation.providerResponseUrl) {
+    const reason = !model ? 'model_removed' : !credential ? 'provider_credential_removed' : 'provider_poll_urls_missing'
+    await run(env, `UPDATE generations SET status = 'failed', provider_state = 'unrecoverable', error = ?, completed_at = ? WHERE id = ?`,
+      reason, nowIso(), generation.id)
+    return { done: true }
+  }
   try {
     if (providerKey(model.provider) === 'byteplus') {
-      const result = await bytePlusRequest(generation.providerStatusUrl, credential, env)
+      const result = await bytePlusRequest(generation.providerStatusUrl, credential, env, { kind: 'poll' })
       const providerState = String(result.status || 'unknown').toLowerCase()
       const attempts = generation.pollAttempts + 1
       if (providerState === 'succeeded') {
@@ -807,11 +1192,11 @@ async function reconcileGeneration(env, context) {
         providerState, attempts, nowIso(), generation.id)
       return { done: false, retrySeconds: 20 }
     }
-    const status = await falRequest(generation.providerStatusUrl, credential, env)
+    const status = await falRequest(generation.providerStatusUrl, credential, env, { kind: 'poll' })
     const providerState = String(status.status || 'unknown').toLowerCase()
     const attempts = generation.pollAttempts + 1
     if (status.status === 'COMPLETED') {
-      const result = await falRequest(generation.providerResponseUrl, credential, env)
+      const result = await falRequest(generation.providerResponseUrl, credential, env, { kind: 'poll' })
       await run(env, `UPDATE generations SET status = 'complete', provider_state = ?, result_json = ?, result_url = ?,
         cost_nano_usd = estimated_cost_nano_usd, cost_source = CASE WHEN estimated_cost_nano_usd > 0 THEN 'catalog_estimate' ELSE 'pending_reconciliation' END,
         poll_attempts = ?, completed_at = ?, last_provider_error = NULL WHERE id = ?`,
@@ -833,7 +1218,7 @@ async function reconcileGeneration(env, context) {
   } catch (error) {
     const attempts = generation.pollAttempts + 1
     await run(env, `UPDATE generations SET poll_attempts = ?, last_provider_error = ?, last_provider_attempt_at = ? WHERE id = ?`,
-      attempts, error instanceof Error ? error.message.slice(0, 500) : 'provider_poll_failed', nowIso(), generation.id)
+      attempts, providerDetail(error).slice(0, 500), nowIso(), generation.id)
     return { done: attempts >= 180, retrySeconds: 60 }
   }
 }
@@ -841,7 +1226,15 @@ async function reconcileGeneration(env, context) {
 async function processGeneration(env, id) {
   const context = await generationContext(env, id)
   if (!context || context.generation.status !== 'queued') return { done: true }
-  if (!context.generation.providerStatusUrl) return dispatchGeneration(env, context)
+  const { generation } = context
+  const age = Date.now() - Date.parse(generation.createdAt)
+  const ceiling = maxQueuedMs(env, generation.kind)
+  if (Number.isFinite(age) && age > ceiling) {
+    await run(env, `UPDATE generations SET status = 'failed', provider_state = 'expired', error = ?, completed_at = ? WHERE id = ?`,
+      `generation_expired_after_${Math.round(ceiling / 60000)}m`, nowIso(), generation.id)
+    return { done: true }
+  }
+  if (!generation.providerStatusUrl) return dispatchGeneration(env, context)
   return reconcileGeneration(env, context)
 }
 
@@ -959,13 +1352,74 @@ async function route(request, env, ctx) {
     return json({ upload: safeUpload(upload) }, 200, origin)
   }
 
+  if (path === '/v1/sessions' && request.method === 'GET') {
+    const modelId = url.searchParams.get('modelId')
+    const bindings = [WORKSPACE_ID, user.id]
+    let clause = 'workspace_id = ? AND user_id = ? AND archived_at IS NULL'
+    if (modelId) {
+      clause += ' AND model_id = ?'
+      bindings.push(modelId)
+    }
+    bindings.push(pageLimit(url, 50))
+    const rows = await all(env, `SELECT s.*, (SELECT COUNT(*) FROM generations g WHERE g.session_id = s.id) AS generation_count
+      FROM generation_sessions s WHERE ${clause} ORDER BY updated_at DESC LIMIT ?`, ...bindings)
+    return json({ sessions: rows.map(row => safeSession(sessionFromRow(row), { generationCount: Number(row.generation_count || 0) })) }, 200, origin)
+  }
+
+  if (path === '/v1/sessions' && request.method === 'POST') {
+    const body = await readJson(request)
+    const model = modelFromRow(await first(env, "SELECT * FROM models WHERE id = ? AND workspace_id = ? AND archived_at IS NULL AND status != 'disabled'", String(body.modelId || ''), WORKSPACE_ID))
+    if (!model) throw new ApiError(400, 'model_required')
+    const session = await sessionFor(env, user, model, null, body.title)
+    return json({ session: safeSession(session, { generationCount: 0 }) }, 201, origin)
+  }
+
+  const sessionMatch = path.match(/^\/v1\/sessions\/([^/]+)$/)
+  if (sessionMatch) {
+    const sessionId = decodeURIComponent(sessionMatch[1])
+    const session = sessionFromRow(await first(env, 'SELECT * FROM generation_sessions WHERE id = ? AND workspace_id = ?', sessionId, WORKSPACE_ID))
+    if (!session || session.userId !== user.id || session.archivedAt) throw new ApiError(404, 'session_not_found')
+
+    if (request.method === 'GET') {
+      const rows = await all(env, 'SELECT * FROM generations WHERE session_id = ? AND workspace_id = ? ORDER BY created_at ASC LIMIT 200', sessionId, WORKSPACE_ID)
+      let generations = rows.map(generationFromRow)
+      const advancing = generations.filter(readyToAdvance).slice(0, MAX_ADVANCE_PER_READ)
+      if (advancing.length) {
+        await Promise.all(advancing.map(item => processGeneration(env, item.id).catch(error => console.error('advance_failed', item.id, error))))
+        const refreshed = await all(env, 'SELECT * FROM generations WHERE session_id = ? AND workspace_id = ? ORDER BY created_at ASC LIMIT 200', sessionId, WORKSPACE_ID)
+        generations = refreshed.map(generationFromRow)
+      }
+      await attachReferences(env, generations)
+      return json({ session: safeSession(session, { generationCount: generations.length }), generations: generations.map(safeGeneration) }, 200, origin)
+    }
+
+    if (request.method === 'PATCH') {
+      const body = await readJson(request)
+      const title = String(body.title || '').trim().slice(0, 120)
+      if (!title) throw new ApiError(400, 'title_required')
+      await run(env, 'UPDATE generation_sessions SET title = ?, updated_at = ? WHERE id = ?', title, nowIso(), sessionId)
+      return json({ session: safeSession({ ...session, title }) }, 200, origin)
+    }
+
+    if (request.method === 'DELETE') {
+      // Archived, not deleted: the generations and their spend stay attributable.
+      await run(env, 'UPDATE generation_sessions SET archived_at = ? WHERE id = ?', nowIso(), sessionId)
+      return json({ archived: true }, 200, origin)
+    }
+  }
+
   if (request.method === 'GET' && path === '/v1/history') return json(await historyPage(env, user, url), 200, origin)
   if (request.method === 'GET' && path === '/v1/usage/summary') return json(await usageSummary(env), 200, origin)
 
   const generationMatch = path.match(/^\/v1\/generations\/([^/]+)$/)
   if (generationMatch && request.method === 'GET') {
-    const generation = generationFromRow(await first(env, 'SELECT * FROM generations WHERE id = ? AND workspace_id = ?', decodeURIComponent(generationMatch[1]), WORKSPACE_ID))
+    const generationId = decodeURIComponent(generationMatch[1])
+    let generation = generationFromRow(await first(env, 'SELECT * FROM generations WHERE id = ? AND workspace_id = ?', generationId, WORKSPACE_ID))
     if (!generation || (user.role !== 'admin' && generation.userId !== user.id)) throw new ApiError(404, 'generation_not_found')
+    if (readyToAdvance(generation)) {
+      await processGeneration(env, generationId).catch(error => console.error('advance_failed', generationId, error))
+      generation = generationFromRow(await first(env, 'SELECT * FROM generations WHERE id = ? AND workspace_id = ?', generationId, WORKSPACE_ID)) || generation
+    }
     await attachReferences(env, [generation])
     return json({ generation: safeGeneration(generation) }, 200, origin)
   }
@@ -1005,10 +1459,11 @@ async function route(request, env, ctx) {
     const createdAt = nowIso()
     const title = String(body.title || prompt.slice(0, 64) || 'Untitled generation').trim().slice(0, 100)
     const options = body.options && typeof body.options === 'object' && !Array.isArray(body.options) ? body.options : {}
+    const session = await sessionFor(env, user, model, body.sessionId, prompt)
     const statements = [env.DB.prepare(`INSERT INTO generations
-      (id, workspace_id, user_id, user_email, model_id, model_name, model_provider, title, kind, prompt, options_json, status, estimated_cost_nano_usd, cost_nano_usd, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?)`)
-      .bind(id, WORKSPACE_ID, user.id, user.email, model.id, model.name, model.provider, title, model.kind, prompt, JSON.stringify(options), estimatedCost, createdAt)]
+      (id, workspace_id, user_id, user_email, model_id, model_name, model_provider, title, kind, prompt, options_json, status, estimated_cost_nano_usd, cost_nano_usd, created_at, session_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, ?)`)
+      .bind(id, WORKSPACE_ID, user.id, user.email, model.id, model.name, model.provider, title, model.kind, prompt, JSON.stringify(options), estimatedCost, createdAt, session.id)]
     for (const referenceId of referenceIds) statements.push(env.DB.prepare('INSERT INTO generation_references (generation_id, upload_id) VALUES (?, ?)').bind(id, referenceId))
     try {
       await env.DB.batch(statements)
@@ -1019,8 +1474,12 @@ async function route(request, env, ctx) {
       throw error
     }
     await audit(env, user, 'generation.submitted', id, { modelId: model.id })
-    const generation = { id, userId: user.id, userEmail: user.email, title, modelId: model.id, modelName: model.name, modelProvider: model.provider, kind: model.kind, prompt, options, status: 'queued', costNanoUsd: 0, createdAt, references: [] }
+    await touchSession(env, session.id)
+    const generation = { id, userId: user.id, userEmail: user.email, title, modelId: model.id, modelName: model.name, modelProvider: model.provider, kind: model.kind, prompt, options, status: 'queued', costNanoUsd: 0, createdAt, sessionId: session.id, references: [] }
     if (referenceIds.length) await attachReferences(env, [generation])
+    if (body.stream === true && model.kind === 'text' && providerKey(model.provider) === 'byteplus') {
+      return streamTextGeneration(env, ctx, { generation, model, credential, origin, session })
+    }
     const processing = await processGeneration(env, id)
     if (!processing.done) {
       ctx.waitUntil(enqueueGeneration(env, id, processing.retrySeconds || 20))
@@ -1117,16 +1576,25 @@ async function route(request, env, ctx) {
     const hasCredential = Boolean(await credentialFor(env, body.provider))
     const priceNanoUsd = toNanoUsd(body.priceUsd || 0)
     if (priceNanoUsd === null) throw new ApiError(400, 'invalid_model_price')
+    if (body.thinkingMode !== undefined && !THINKING_MODES.includes(body.thinkingMode)) throw new ApiError(400, 'invalid_thinking_mode')
+    if (body.textApi !== undefined && !TEXT_APIS.includes(body.textApi)) throw new ApiError(400, 'invalid_text_api')
+    if (body.contextTurns !== undefined) {
+      const parsed = Number(body.contextTurns)
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > MAX_CONTEXT_TURNS) throw new ApiError(400, 'invalid_context_turns')
+    }
     const created = {
       id: crypto.randomUUID(), name: String(body.name).trim().slice(0, 120), description: String(body.description || '').trim().slice(0, 500),
       provider: String(body.provider).trim().slice(0, 120), kind: body.kind, endpoint: String(body.endpoint || '').trim().slice(0, 300) || null,
-      status: hasCredential ? (body.status === 'beta' ? 'beta' : 'active') : 'disabled', priceNanoUsd, createdAt: nowIso(), archivedAt: null,
+      status: hasCredential ? (body.status === 'beta' ? 'beta' : 'active') : 'disabled', priceNanoUsd,
+      thinkingMode: body.thinkingMode || 'disabled', textApi: body.textApi || 'chat_completions',
+      contextTurns: body.contextTurns === undefined ? 8 : Math.floor(Number(body.contextTurns)),
+      createdAt: nowIso(), archivedAt: null,
     }
     await run(env, `INSERT INTO models
-      (id, workspace_id, name, description, provider, kind, endpoint, status, price_nano_usd, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, created.id, WORKSPACE_ID, created.name, created.description, created.provider, created.kind, created.endpoint, created.status, created.priceNanoUsd, created.createdAt)
+      (id, workspace_id, name, description, provider, kind, endpoint, status, price_nano_usd, thinking_mode, text_api, context_turns, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, created.id, WORKSPACE_ID, created.name, created.description, created.provider, created.kind, created.endpoint, created.status, created.priceNanoUsd, created.thinkingMode, created.textApi, created.contextTurns, created.createdAt)
     await audit(env, user, 'model.created', created.id, { provider: created.provider, kind: created.kind, credentialUpdated: Boolean(apiKey) })
-    return json({ model: (await safeModels(env, [{ ...created, price_nano_usd: priceNanoUsd, created_at: created.createdAt, archived_at: null }]))[0] }, 201, origin)
+    return json({ model: (await safeModels(env, [{ ...created, price_nano_usd: priceNanoUsd, thinking_mode: created.thinkingMode, text_api: created.textApi, context_turns: created.contextTurns, created_at: created.createdAt, archived_at: null }]))[0] }, 201, origin)
   }
 
   if (request.method === 'GET' && path === '/v1/admin/providers') {
@@ -1151,13 +1619,22 @@ async function route(request, env, ctx) {
       priceNanoUsd = toNanoUsd(body.priceUsd)
       if (priceNanoUsd === null) throw new ApiError(400, 'invalid_model_price')
     }
+    if (body.thinkingMode !== undefined && !THINKING_MODES.includes(body.thinkingMode)) throw new ApiError(400, 'invalid_thinking_mode')
+    if (body.textApi !== undefined && !TEXT_APIS.includes(body.textApi)) throw new ApiError(400, 'invalid_text_api')
+    if (body.contextTurns !== undefined) {
+      const parsed = Number(body.contextTurns)
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > MAX_CONTEXT_TURNS) throw new ApiError(400, 'invalid_context_turns')
+    }
+    const thinking = body.thinkingMode !== undefined ? body.thinkingMode : target.thinkingMode
+    const api = body.textApi !== undefined ? body.textApi : target.textApi
+    const turns = body.contextTurns !== undefined ? Math.floor(Number(body.contextTurns)) : target.contextTurns
     const apiKey = String(body.apiKey || '').trim()
     if (apiKey) await storeCredential(env, provider, apiKey)
-    await run(env, 'UPDATE models SET name = ?, description = ?, provider = ?, kind = ?, endpoint = ?, status = ?, price_nano_usd = ? WHERE id = ?',
-      name, description, provider, kind, endpoint, status, priceNanoUsd, target.id)
-    const updated = { ...target, name, description, provider, kind, endpoint, status, priceNanoUsd }
+    await run(env, 'UPDATE models SET name = ?, description = ?, provider = ?, kind = ?, endpoint = ?, status = ?, price_nano_usd = ?, thinking_mode = ?, text_api = ?, context_turns = ? WHERE id = ?',
+      name, description, provider, kind, endpoint, status, priceNanoUsd, thinking, api, turns, target.id)
+    const updated = { ...target, name, description, provider, kind, endpoint, status, priceNanoUsd, thinkingMode: thinking, textApi: api, contextTurns: turns }
     await audit(env, user, 'model.updated', target.id, { status, provider, kind, credentialUpdated: Boolean(apiKey) })
-    return json({ model: (await safeModels(env, [{ ...updated, price_nano_usd: priceNanoUsd, created_at: updated.createdAt, archived_at: null }]))[0] }, 200, origin)
+    return json({ model: (await safeModels(env, [{ ...updated, price_nano_usd: priceNanoUsd, thinking_mode: thinking, text_api: api, context_turns: turns, created_at: updated.createdAt, archived_at: null }]))[0] }, 200, origin)
   }
 
   if (modelMatch && request.method === 'DELETE') {
@@ -1243,11 +1720,21 @@ async function queueHandler(batch, env) {
 
 async function scheduledHandler(_controller, env, ctx) {
   const work = async () => {
-    const pending = await all(env, "SELECT id FROM generations WHERE workspace_id = ? AND status = 'queued' ORDER BY created_at LIMIT 50", WORKSPACE_ID)
-    if (env.GENERATION_QUEUE && pending.length) {
-      await env.GENERATION_QUEUE.sendBatch(pending.map(item => ({ body: { generationId: item.id } })))
+    const pending = await all(env, `SELECT id, created_at, last_provider_attempt_at FROM generations
+      WHERE workspace_id = ? AND status = 'queued' ORDER BY created_at LIMIT 50`, WORKSPACE_ID)
+    // Anything the queue has not advanced recently is processed here directly, so a
+    // queue that is unavailable, unbound or whose consumer is failing cannot strand
+    // a job. Fresh rows still take the fast queue path.
+    const now = Date.now()
+    const stale = pending.filter(item => now - Date.parse(item.last_provider_attempt_at || item.created_at) > STALE_QUEUED_MS)
+    const fresh = pending.filter(item => !stale.includes(item))
+    if (env.GENERATION_QUEUE && fresh.length) {
+      await env.GENERATION_QUEUE.sendBatch(fresh.map(item => ({ body: { generationId: item.id } })))
     } else {
-      await Promise.all(pending.map(item => processGeneration(env, item.id)))
+      await Promise.all(fresh.map(item => processGeneration(env, item.id)))
+    }
+    for (const item of stale) {
+      await processGeneration(env, item.id).catch(error => console.error('stale_generation_failed', item.id, error))
     }
     await run(env, 'DELETE FROM login_rate_limits WHERE window_started_at < ?', Date.now() - 24 * 60 * 60 * 1000)
     const lastFalSync = await first(env, "SELECT synced_at FROM provider_balances WHERE workspace_id = ? AND provider = 'fal.ai'", WORKSPACE_ID)
@@ -1270,9 +1757,18 @@ export const __test = {
   decryptSecret,
   encryptSecret,
   hashPassword,
+  isTimeoutError,
+  providerFailure,
   providerOutputText,
   providerKey,
+  providerTimeoutMs,
+  maxQueuedMs,
+  contextTurns,
+  trimContext,
   resultUrl,
+  streamTextDelta,
+  textRequestBody,
+  textRequestPath,
   signToken,
   toNanoUsd,
   verifyPassword,

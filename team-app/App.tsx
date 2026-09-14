@@ -1,160 +1,549 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import * as DocumentPicker from 'expo-document-picker'
 import * as FileSystem from 'expo-file-system/legacy'
 import * as Sharing from 'expo-sharing'
 import { VideoView, useVideoPlayer } from 'expo-video'
-import { Image, RefreshControl, SafeAreaView, ScrollView, StyleSheet, Switch, Text, TextInput, TouchableOpacity, View } from 'react-native'
-import { ArrowDownToLine, ArrowUpRight, Bell, Clock3, Gauge, Grid2x2, Image as ImageIcon, LockKeyhole, MessageSquare, Settings, Sparkles, Upload, Video, X } from 'lucide-react-native'
-import { colors, radius } from '@cresco/mobile-shared/tokens'
-import { clearMobileSession, getGeneration, getMemberWorkspace, login as apiLogin, restoreMobileSession, submitGeneration, uploadMobileReference, type ApiGeneration, type ApiUpload, type UsageSummary } from '@cresco/mobile-shared/api'
+import {
+  ActivityIndicator, Image, KeyboardAvoidingView, Platform, RefreshControl, SafeAreaView,
+  ScrollView, StatusBar, Text, TextInput, TouchableOpacity, View,
+} from 'react-native'
+import { ArrowDownToLine, ChevronLeft, Gauge, LayoutGrid, MessageSquare, Paperclip, Plus, Send, Settings as SettingsIcon, Trash2, X } from 'lucide-react-native'
+import { elapsed, kindColor, money, radius, relativeTime, space, type Theme } from '@cresco/mobile-shared/tokens'
+import {
+  archiveSession, clearMobileSession, getGeneration, getMemberWorkspace, getSession, listSessions,
+  login as apiLogin, restoreMobileSession, submitGeneration, uploadMobileReference,
+  type ApiGeneration, type ApiModel, type ApiSession, type ApiUpload, type UsageSummary,
+} from '@cresco/mobile-shared/api'
+import { Button, Card, Empty, ErrorNote, KindBadge, StatusPill, sheet, useTheme, type Kind } from './ui'
+import { ThemeProvider, useThemeChoice, type ThemeChoice } from './theme'
 
-type MobileModel = { id: string; name: string; provider: string; type: 'Text' | 'Image' | 'Video'; icon: any; tint: string; estimate: string; ready?: boolean }
-const modelFixtures: MobileModel[] = [
-  { id: 'gpt', name: 'GPT-5', provider: 'OpenAI', type: 'Text', icon: MessageSquare, tint: colors.coral, estimate: '$0.02' },
-  { id: 'claude', name: 'Claude Sonnet', provider: 'Anthropic', type: 'Text', icon: Sparkles, tint: colors.lilac, estimate: '$0.03' },
-  { id: 'veo', name: 'Veo 3', provider: 'Google', type: 'Video', icon: Video, tint: colors.blue, estimate: '$0.62' },
-  { id: 'seedance', name: 'Seedance 2.0', provider: 'fal.ai · ByteDance', type: 'Video', icon: Video, tint: colors.sage, estimate: '$3.03' },
-  { id: 'imagen', name: 'Imagen 4', provider: 'Google', type: 'Image', icon: ImageIcon, tint: colors.sand, estimate: '$0.08' },
-]
+type Tab = 'models' | 'chats' | 'usage' | 'settings'
+type OpenThread = { model: ApiModel; sessionId?: string }
+
+const emptyUsage: UsageSummary = { spendNanoUsd: 0, calls: 0, byModel: [], balances: [] }
 
 export default function App() {
-  const [tab, setTab] = useState('Home')
-  const [loggedIn, setLoggedIn] = useState(false)
+  return <ThemeProvider><Workspace /></ThemeProvider>
+}
+
+function Workspace() {
+  const theme = useTheme()
   const [restoring, setRestoring] = useState(true)
-  const [memberName, setMemberName] = useState('Team member')
-  const [models, setModels] = useState<MobileModel[]>(modelFixtures)
+  const [signedIn, setSignedIn] = useState(false)
+  const [name, setName] = useState('')
+  const [tab, setTab] = useState<Tab>('models')
+  const [models, setModels] = useState<ApiModel[]>([])
   const [history, setHistory] = useState<ApiGeneration[]>([])
-  const [usage, setUsage] = useState<UsageSummary>({ spendNanoUsd: 0, calls: 0, byModel: [], balances: [] })
-  const [selectedModel, setSelectedModel] = useState<MobileModel | null>(null)
-  const [refreshing,setRefreshing]=useState(false)
-  const refresh=useCallback(async()=>{
-    const data=await getMemberWorkspace()
-    const tints=[colors.coral,colors.lilac,colors.blue,colors.sage,colors.sand]
-    setModels(data.models.map((item,index)=>{
-      const fixture=modelFixtures.find(model=>model.id===item.id||model.name===item.name)
-      const type=(item.kind[0].toUpperCase()+item.kind.slice(1)) as MobileModel['type']
-      return {id:item.id,name:item.name,provider:item.provider,type,icon:fixture?.icon||(type==='Video'?Video:type==='Image'?ImageIcon:MessageSquare),tint:fixture?.tint||tints[index%tints.length],estimate:item.priceNanoUsd?(item.priceNanoUsd/1_000_000_000).toLocaleString('en-US',{style:'currency',currency:'USD'}):'Tracked after run',ready:Boolean(item.executionReady)}
-    }))
-    setHistory(data.generations);setUsage(data.usage)
-  },[])
-  const pullRefresh=useCallback(async()=>{setRefreshing(true);try{await refresh()}catch{ /* Existing content remains visible when a refresh is temporarily unavailable. */ }finally{setRefreshing(false)}},[refresh])
-  const hasProcessingWork=history.some(item=>item.status==='queued')
-  useEffect(()=>{
-    if(!loggedIn||!hasProcessingWork)return
-    const timer=setInterval(()=>void refresh().catch(()=>undefined),5000)
-    return()=>clearInterval(timer)
-  },[loggedIn,hasProcessingWork,refresh])
-  useEffect(()=>{
-    let active=true
-    restoreMobileSession().then(async session=>{
-      if(!active||!session)return
+  const [usage, setUsage] = useState<UsageSummary>(emptyUsage)
+  const [sessions, setSessions] = useState<ApiSession[]>([])
+  const [open, setOpen] = useState<OpenThread | null>(null)
+  const [refreshing, setRefreshing] = useState(false)
+
+  const refresh = useCallback(async () => {
+    const [data, threads] = await Promise.all([getMemberWorkspace(), listSessions().catch(() => ({ sessions: [] }))])
+    setModels(data.models)
+    setHistory(data.generations)
+    setUsage(data.usage)
+    setSessions(threads.sessions)
+  }, [])
+
+  const pull = useCallback(async () => {
+    setRefreshing(true)
+    try { await refresh() } catch { /* keep showing what we already have */ }
+    finally { setRefreshing(false) }
+  }, [refresh])
+
+  // Reads advance queued jobs on the server, so polling here both refreshes the
+  // list and moves the work along.
+  const waiting = history.some(item => item.status === 'queued')
+  useEffect(() => {
+    if (!signedIn || !waiting) return
+    const timer = setInterval(() => void refresh().catch(() => undefined), 4000)
+    return () => clearInterval(timer)
+  }, [signedIn, waiting, refresh])
+
+  useEffect(() => {
+    let active = true
+    restoreMobileSession()
+      .then(async session => {
+        if (!active || !session) return
+        await refresh()
+        if (!active) return
+        setName(session.user.name)
+        setSignedIn(true)
+      })
+      .catch(() => void clearMobileSession())
+      .finally(() => { if (active) setRestoring(false) })
+    return () => { active = false }
+  }, [refresh])
+
+  if (restoring) {
+    return <SafeAreaView style={[sheet.screen, { backgroundColor: theme.bg, alignItems: 'center', justifyContent: 'center' }]}>
+      <ActivityIndicator color={theme.accent} />
+    </SafeAreaView>
+  }
+
+  if (!signedIn) {
+    return <SignIn onSignedIn={async (email, password) => {
+      const session = await apiLogin(email, password, 'team-mobile')
       await refresh()
-      if(active){setMemberName(session.user.name);setLoggedIn(true)}
-    }).catch(()=>void clearMobileSession()).finally(()=>{if(active)setRestoring(false)})
-    return()=>{active=false}
-  },[refresh])
-  if(restoring)return <SafeAreaView style={styles.safe}><View style={styles.splash}><Sparkles size={22} color={colors.ink}/><Text style={styles.kicker}>CRESCO LABS</Text></View></SafeAreaView>
-  if (!loggedIn) return <Login onLogin={async (email,password) => {
-    const session = await apiLogin(email,password,'team-mobile')
-    await refresh();setMemberName(session.user.name);setLoggedIn(true)
-  }} />
-  if (selectedModel) return <Workspace model={selectedModel} onBack={() => setSelectedModel(null)} onRefresh={refresh} onSubmitted={generation=>setHistory(items=>[generation,...items])} />
-  return <SafeAreaView style={styles.safe}><ScrollView contentContainerStyle={styles.content} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={pullRefresh} tintColor={colors.ink} colors={[colors.ink]} progressBackgroundColor={colors.glassStrong}/>}><View style={styles.header}><View><Text style={styles.kicker}>CRESCO LABS</Text><Text style={styles.title}>Welcome, {memberName.split(' ')[0]} <Text style={styles.star}>✦</Text></Text><Text style={styles.sub}>Your models are ready. What are we making?</Text></View><View style={styles.avatar}><Text>{memberName.split(' ').map(part=>part[0]).join('').slice(0,2)}</Text></View></View><View style={styles.pillNav}>{[['Home', Grid2x2], ['History', Clock3], ['Usage', Gauge], ['Settings', Settings]].map(([label, Icon]: any) => <TouchableOpacity key={label} style={[styles.navItem, tab === label && styles.navSelected]} onPress={()=>setTab(label)}><Icon size={14} color={tab === label ? colors.ink : colors.muted}/><Text style={styles.navText}>{label}</Text></TouchableOpacity>)}</View>{tab === 'Home' ? <HomeView models={models} onSelect={setSelectedModel}/> : tab === 'History' ? <HistoryView history={history} models={models}/> : tab === 'Usage' ? <UsageView usage={usage}/> : <SettingsView onLogout={()=>{void clearMobileSession();setLoggedIn(false);setTab('Home')}}/>}</ScrollView></SafeAreaView>
-}
+      setName(session.user.name)
+      setSignedIn(true)
+    }} />
+  }
 
-function HomeView({models,onSelect}:{models:MobileModel[];onSelect:(model:MobileModel)=>void}){return <><View style={styles.sectionHead}><Text style={styles.sectionTitle}>Model studio</Text><Text style={styles.sectionSub}>{models.filter(model=>model.ready).length} ready · {models.length} connected</Text></View>{models.map(model=>{const Icon=model.icon;return <TouchableOpacity disabled={!model.ready} key={model.id} style={[styles.card,!model.ready&&styles.cardDisabled]} activeOpacity={.85} onPress={()=>onSelect(model)}><View style={[styles.modelIcon,{backgroundColor:model.tint}]}><Icon size={20} color={colors.ink}/></View><View style={styles.cardCopy}><Text style={styles.modelType}>{model.type.toUpperCase()} · {model.provider}</Text><Text style={styles.modelName}>{model.name}</Text><Text style={styles.modelDesc}>{model.ready?'Create, explore and turn an idea into something real.':'Waiting for administrator setup.'}</Text></View>{model.ready?<ArrowUpRight size={17} color={colors.muted}/>:<LockKeyhole size={16} color={colors.muted}/>}</TouchableOpacity>})}</>}
-function HistoryView({history,models}:{history:ApiGeneration[];models:MobileModel[]}){
-  const [selectedId,setSelectedId]=useState<string|null>(null)
-  return <View><Text style={styles.sectionTitle}>History</Text><Text style={styles.sectionSub}>Your latest work across every model.</Text>{history.map(item=>{
-    const model=models.find(entry=>entry.id===item.modelId)
-    const type=((item.kind[0].toUpperCase()+item.kind.slice(1)) as MobileModel['type'])
-    const selected=selectedId===item.id
-    return <View key={item.id}><TouchableOpacity disabled={item.status==='queued'} onPress={()=>setSelectedId(value=>value===item.id?null:item.id)} style={mobile.listRow}><View style={mobile.historyDot}/><View style={styles.cardCopy}><Text style={mobile.actionTitle}>{item.title}</Text><Text style={mobile.actionMeta}>{model?.name||item.modelName||item.modelId} · {item.modelProvider||'Provider'} · {(item.costNanoUsd/1_000_000_000).toLocaleString('en-US',{style:'currency',currency:'USD'})} · {item.status==='queued'?'Processing':item.status==='complete'?'Complete':'Failed'}</Text>{item.outputText&&!selected?<Text style={mobile.responseText} numberOfLines={4}>{item.outputText}</Text>:null}</View>{item.status==='queued'?<Clock3 size={15} color={colors.muted}/>:<Text style={[mobile.chevron,selected&&mobile.chevronOpen]}>›</Text>}</TouchableOpacity>{selected&&item.status==='complete'?<MobileResult generation={item} type={type}/>:selected&&item.status==='failed'?<View style={[mobile.resultCard,mobile.failedCard]}><X size={20} color="#A94E43"/><View style={styles.cardCopy}><Text style={mobile.resultTitle}>Request failed</Text><Text style={mobile.resultMeta}>{item.error||'The provider could not complete this request.'}</Text></View></View>:null}</View>
-  })}</View>
-}
-function UsageView({usage}:{usage:UsageSummary}){
-  const limit=Number(usage.budget?.workspaceMonthlyLimitNanoUsd||0)
-  const committed=Number(usage.monthlyCommittedNanoUsd||0)
-  return <View><Text style={styles.sectionTitle}>Usage</Text><Text style={styles.sectionSub}>Spend is visible to everyone on the team.</Text><View style={mobile.metricCard}><Text style={mobile.metricLabel}>TRACKED TEAM SPEND</Text><Text style={mobile.metricValue}>{(usage.spendNanoUsd/1_000_000_000).toLocaleString('en-US',{style:'currency',currency:'USD'})}</Text><Text style={mobile.actionMeta}>{usage.calls.toLocaleString()} generations across {usage.byModel.length} models</Text></View><View style={mobile.metricCard}><Text style={mobile.metricLabel}>MONTHLY WORKSPACE BUDGET</Text><Text style={mobile.metricValue}>{limit>0?(limit/1_000_000_000).toLocaleString('en-US',{style:'currency',currency:'USD'}):'No cap'}</Text><Text style={mobile.actionMeta}>{(committed/1_000_000_000).toLocaleString('en-US',{style:'currency',currency:'USD'})} committed this month{limit>0?` · warning at ${usage.budget?.warnAtPercent||80}%`:''}</Text></View>{usage.byModel.map(item=>{const share=usage.spendNanoUsd?Math.round(item.spendNanoUsd/usage.spendNanoUsd*100):0;return <View style={mobile.usageRow} key={item.modelId}><View style={styles.cardCopy}><Text style={mobile.actionTitle}>{item.name}</Text><Text style={mobile.actionMeta}>{share}% of total · {item.calls} calls</Text></View><Text style={mobile.usageCost}>{(item.spendNanoUsd/1_000_000_000).toLocaleString('en-US',{style:'currency',currency:'USD'})}</Text></View>})}</View>
-}
-function SettingsView({onLogout}:{onLogout:()=>void}){const [completion,setCompletion]=useState(true);const [weekly,setWeekly]=useState(true);return <View><Text style={styles.sectionTitle}>Settings</Text><Text style={styles.sectionSub}>Your personal Cresco Labs preferences.</Text><SettingToggle icon={Bell} title="Generation completed" detail="Notify me when media is ready" value={completion} onChange={setCompletion}/><SettingToggle icon={Gauge} title="Weekly usage summary" detail="Monday team spend overview" value={weekly} onChange={setWeekly}/><Setting icon={LockKeyhole} title="Privacy & sessions" detail="Current device · Active now"/><Setting icon={Settings} title="Appearance" detail="System theme · Liquid Glass"/><TouchableOpacity style={styles.loginButton} onPress={onLogout}><Text style={styles.loginButtonText}>Log out</Text></TouchableOpacity></View>}
-function SettingToggle({icon:Icon,title,detail,value,onChange}:{icon:any,title:string,detail:string,value:boolean,onChange:(value:boolean)=>void}){return <View style={mobile.listRow}><View style={mobile.settingIcon}><Icon size={17} color="#719552"/></View><View style={styles.cardCopy}><Text style={mobile.actionTitle}>{title}</Text><Text style={mobile.actionMeta}>{detail}</Text></View><Switch value={value} onValueChange={onChange} trackColor={{false:'#D9DFDA',true:'#A8CB85'}} thumbColor="#fff"/></View>}
-function Setting({icon:Icon,title,detail}:{icon:any,title:string,detail:string}){return <TouchableOpacity style={mobile.listRow}><View style={mobile.settingIcon}><Icon size={17} color="#719552"/></View><View style={styles.cardCopy}><Text style={mobile.actionTitle}>{title}</Text><Text style={mobile.actionMeta}>{detail}</Text></View><ChevronMark/></TouchableOpacity>}
-function ChevronMark(){return <Text style={mobile.chevron}>›</Text>}
+  if (open) {
+    return <ThreadScreen
+      key={open.sessionId || `new-${open.model.id}`}
+      model={open.model}
+      sessionId={open.sessionId}
+      onBack={() => setOpen(null)}
+      onNew={() => setOpen({ model: open.model })}
+      onCreated={generation => setHistory(items => [generation, ...items.filter(item => item.id !== generation.id)])}
+      onRefresh={refresh}
+    />
+  }
 
-function Workspace({ model, onBack, onRefresh, onSubmitted }: { model: MobileModel; onBack: () => void; onRefresh: () => Promise<void>; onSubmitted: (generation: ApiGeneration) => void }) {
-  const [prompt, setPrompt] = useState('')
-  const [generation, setGeneration] = useState<ApiGeneration|null>(null)
-  const [busy,setBusy]=useState(false)
-  const [error,setError]=useState('')
-  const [aspect,setAspect]=useState(model.type==='Image'?'1:1':'16:9')
-  const [duration,setDuration]=useState('10 seconds')
-  const [references,setReferences]=useState<ApiUpload[]>([])
-  const [uploading,setUploading]=useState(false)
-  const [refreshing,setRefreshing]=useState(false)
-  const Icon = model.icon
-  useEffect(()=>{
-    if(!generation||generation.status!=='queued')return
-    let active=true
-    let timer:ReturnType<typeof setTimeout>
-    const poll=async()=>{try{const next=(await getGeneration(generation.id)).generation;if(!active)return;setGeneration(next);if(next.status==='queued')timer=setTimeout(poll,2000)}catch(reason){if(active)setError(reason instanceof Error?reason.message:'Could not refresh the provider response.')}}
-    timer=setTimeout(poll,1200)
-    return()=>{active=false;clearTimeout(timer)}
-  },[generation?.id,generation?.status])
-  const attach=async()=>{setError('');try{const picked=await DocumentPicker.getDocumentAsync({type:model.type==='Image'?'image/*':['image/*','video/*','audio/*'],multiple:true,copyToCacheDirectory:true});if(picked.canceled)return;const available=Math.max(0,5-references.length);if(!available)return setError('You can attach up to five references.');setUploading(true);const uploaded=await Promise.all(picked.assets.slice(0,available).map(asset=>uploadMobileReference({uri:asset.uri,name:asset.name,mimeType:asset.mimeType})));setReferences(items=>[...items,...uploaded.map(item=>item.upload)])}catch(reason){setError(reason instanceof Error?reason.message:'Could not upload this reference.')}finally{setUploading(false)}}
-  const generate=async()=>{if(!prompt.trim())return;setBusy(true);setError('');setGeneration(null);try{const next=(await submitGeneration(model.id,prompt.trim(),{aspect,...(model.type==='Video'?{duration}:{})},references.map(item=>item.id))).generation;onSubmitted(next);setGeneration(next)}catch(reason){setError(reason instanceof Error?reason.message:'Could not send this request.')}finally{setBusy(false)}}
-  const pullRefresh=async()=>{setRefreshing(true);setError('');try{await onRefresh();if(generation)setGeneration((await getGeneration(generation.id)).generation)}catch(reason){setError(reason instanceof Error?reason.message:'Could not refresh this workspace.')}finally{setRefreshing(false)}}
-  return <SafeAreaView style={styles.safe}>
-    <ScrollView contentContainerStyle={styles.content} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={pullRefresh} tintColor={colors.ink} colors={[colors.ink]} progressBackgroundColor={colors.glassStrong}/> }>
-      <TouchableOpacity onPress={onBack}><Text style={styles.back}>‹ Back to studio</Text></TouchableOpacity>
-      <View style={[styles.workspaceIcon,{backgroundColor:model.tint}]}><Icon size={24} color={colors.ink}/></View>
-      <Text style={styles.kicker}>{model.provider} · {model.type} WORKSPACE</Text>
-      <Text style={styles.workspaceTitle}>Create with {model.name}</Text>
-      <Text style={styles.sub}>{model.type === 'Video' ? 'Describe a scene, movement and mood.' : model.type === 'Text' ? 'Ask a question or describe what you want to make.' : 'Describe the visual you want to create.'}</Text>
-      {model.type !== 'Text' && <View style={styles.options}><TouchableOpacity style={styles.optionsTouchable} onPress={()=>setAspect(aspect==='16:9'?'9:16':aspect==='9:16'?'1:1':'16:9')}><Text style={styles.optionsText}>{aspect} ⌄</Text></TouchableOpacity>{model.type==='Video'&&<TouchableOpacity style={styles.optionsTouchable} onPress={()=>setDuration(duration==='5 seconds'?'10 seconds':duration==='10 seconds'?'15 seconds':'5 seconds')}><Text style={styles.optionsText}>{duration} ⌄</Text></TouchableOpacity>}</View>}
-      <TextInput style={styles.prompt} multiline placeholder={model.type === 'Video' ? 'Describe your scene...' : 'Start writing your prompt...'} placeholderTextColor={colors.muted} selectionColor={colors.sage} value={prompt} onChangeText={value=>{setPrompt(value);setGeneration(null)}}/>
-      {model.type!=='Text'&&<><TouchableOpacity disabled={uploading||references.length>=5} style={mobile.uploadButton} onPress={attach}><Upload size={15} color={colors.muted}/><Text style={mobile.uploadText}>{uploading?'Uploading…':`Add reference files · ${references.length}/5`}</Text></TouchableOpacity>{references.map(reference=><View style={mobile.referenceRow} key={reference.id}><View style={styles.cardCopy}><Text style={mobile.actionTitle} numberOfLines={1}>{reference.fileName}</Text><Text style={mobile.actionMeta}>{(reference.size/1024/1024).toFixed(1)} MB</Text></View><TouchableOpacity onPress={()=>setReferences(items=>items.filter(item=>item.id!==reference.id))}><X size={15} color={colors.muted}/></TouchableOpacity></View>)}</>}
-      {error?<Text style={styles.loginNote}>{error}</Text>:null}
-      {generation?.status==='queued'&&<View style={mobile.resultCard}><View style={mobile.processingDot}/><View style={styles.cardCopy}><Text style={mobile.resultTitle}>Provider is processing</Text><Text style={mobile.resultMeta}>The request was sent immediately. This screen will update automatically.</Text></View></View>}
-      {generation?.status==='failed'&&<View style={[mobile.resultCard,mobile.failedCard]}><X size={20} color="#A94E43"/><View style={styles.cardCopy}><Text style={mobile.resultTitle}>Request failed</Text><Text style={mobile.resultMeta}>{generation.error||'The provider could not complete this request.'}</Text></View></View>}
-      {generation?.status==='complete'&&<MobileResult generation={generation} type={model.type}/>}
-      <View style={styles.workspaceFooter}>
-        <Text style={styles.cost}>Estimated cost · <Text style={{fontWeight:'700'}}>{model.estimate}</Text></Text>
-        <TouchableOpacity disabled={!prompt.trim()||busy||uploading} onPress={generate} style={[styles.generate,(!prompt.trim()||busy||uploading)&&styles.generateDisabled]}><Sparkles size={17} color="#fff"/><Text style={styles.generateText}>{busy?'Sending…':'Generate'}</Text></TouchableOpacity>
-      </View>
+  const titles: Record<Tab, string> = { models: 'Models', chats: 'Chats', usage: 'Usage', settings: 'Settings' }
+
+  return <SafeAreaView style={[sheet.screen, { backgroundColor: theme.bg }]}>
+    <StatusBar barStyle={theme.bg === '#ffffff' ? 'dark-content' : 'light-content'} />
+    <View style={{ paddingHorizontal: space.lg, paddingTop: space.md, paddingBottom: space.sm }}>
+      <Text style={{ fontSize: 24, fontWeight: '700', color: theme.text, letterSpacing: -0.4 }}>{titles[tab]}</Text>
+      {tab === 'models' && <Text style={{ fontSize: 13, color: theme.textFaint, marginTop: 2 }}>Signed in as {name}</Text>}
+    </View>
+
+    <ScrollView
+      contentContainerStyle={sheet.scroll}
+      refreshControl={<RefreshControl refreshing={refreshing} onRefresh={pull} tintColor={theme.textMuted} />}
+    >
+      {tab === 'models' && <ModelList models={models} onOpen={model => setOpen({ model })} theme={theme} />}
+      {tab === 'chats' && <ChatList
+        sessions={sessions}
+        models={models}
+        theme={theme}
+        onOpen={(model, sessionId) => setOpen({ model, sessionId })}
+        onArchive={id => { setSessions(items => items.filter(item => item.id !== id)); void archiveSession(id).catch(() => undefined) }}
+      />}
+      {tab === 'usage' && <UsageView usage={usage} theme={theme} />}
+      {tab === 'settings' && <SettingsView name={name} theme={theme} onSignOut={() => { void clearMobileSession(); setSignedIn(false); setTab('models') }} />}
     </ScrollView>
+
+    <View style={{ flexDirection: 'row', borderTopWidth: 1, borderTopColor: theme.border, backgroundColor: theme.bgSubtle, paddingBottom: space.sm }}>
+      {([['models', LayoutGrid], ['chats', MessageSquare], ['usage', Gauge], ['settings', SettingsIcon]] as const).map(([value, Icon]) => (
+        <TouchableOpacity
+          key={value}
+          accessibilityRole="tab"
+          accessibilityState={{ selected: tab === value }}
+          onPress={() => setTab(value)}
+          style={{ flex: 1, minHeight: 52, alignItems: 'center', justifyContent: 'center', gap: 3, paddingTop: space.sm }}
+        >
+          <Icon size={19} color={tab === value ? theme.accent : theme.textFaint} />
+          <Text style={{ fontSize: 11, fontWeight: tab === value ? '600' : '400', color: tab === value ? theme.text : theme.textFaint }}>{titles[value]}</Text>
+        </TouchableOpacity>
+      ))}
+    </View>
   </SafeAreaView>
 }
 
-function MobileResult({generation,type}:{generation:ApiGeneration;type:MobileModel['type']}){
-  const [saving,setSaving]=useState(false)
-  const [saveError,setSaveError]=useState('')
-  const save=async()=>{if(!generation.resultUrl)return;setSaving(true);setSaveError('');try{const clean=generation.resultUrl.split('?')[0];const ext=clean.split('.').pop()?.slice(0,5)||(type==='Video'?'mp4':'png');const target=FileSystem.cacheDirectory+`cresco-${generation.id}.${ext}`;const downloaded=await FileSystem.downloadAsync(generation.resultUrl,target);if(!(await Sharing.isAvailableAsync()))throw new Error('Saving is not available on this device.');await Sharing.shareAsync(downloaded.uri,{dialogTitle:'Save Cresco result'})}catch(reason){setSaveError(reason instanceof Error?reason.message:'Could not save this result.')}finally{setSaving(false)}}
-  return <View style={mobile.inlineResult}><View style={mobile.resultHeading}><Sparkles size={20} color="#70964F"/><View><Text style={mobile.resultTitle}>Result ready</Text><Text style={mobile.resultMeta}>View and save it without leaving Cresco</Text></View></View>{generation.outputText?<Text selectable style={mobile.outputText}>{generation.outputText}</Text>:null}{generation.resultUrl&&type==='Image'?<Image source={{uri:generation.resultUrl}} resizeMode="contain" style={mobile.resultImage}/>:null}{generation.resultUrl&&type==='Video'?<MobileVideo url={generation.resultUrl}/>:null}{saveError?<Text style={styles.loginNote}>{saveError}</Text>:null}{generation.resultUrl?<TouchableOpacity disabled={saving} style={[mobile.downloadButton,{flex:0,marginTop:15}]} onPress={save}><ArrowDownToLine size={17} color="#fff"/><Text style={mobile.downloadText}>{saving?'Preparing…':'Download / save'}</Text></TouchableOpacity>:null}</View>
+function ModelList({ models, onOpen, theme }: { models: ApiModel[]; onOpen: (model: ApiModel) => void; theme: Theme }) {
+  if (!models.length) return <Empty title="No models yet" text="An administrator connects models from the Cresco admin app. They appear here straight away." />
+  return <View style={{ gap: space.sm }}>
+    {models.map(model => {
+      const ready = Boolean(model.executionReady)
+      return <TouchableOpacity key={model.id} disabled={!ready} activeOpacity={0.8} onPress={() => onOpen(model)}>
+        <Card style={{ padding: space.lg, flexDirection: 'row', alignItems: 'center', gap: space.md, opacity: ready ? 1 : 0.55 }}>
+          <KindBadge kind={model.kind as Kind} />
+          <View style={sheet.grow}>
+            <Text style={{ fontSize: 15, fontWeight: '600', color: theme.text }}>{model.name}</Text>
+            <Text style={{ fontSize: 12, color: theme.textFaint, marginTop: 2 }}>
+              {model.provider} · {ready ? (model.priceNanoUsd ? `${money(model.priceNanoUsd)} per run` : 'cost tracked per run') : 'setup needed'}
+            </Text>
+          </View>
+          <View style={{ width: 7, height: 7, borderRadius: 4, backgroundColor: kindColor(theme, model.kind as Kind) }} />
+        </Card>
+      </TouchableOpacity>
+    })}
+  </View>
 }
 
-function MobileVideo({url}:{url:string}){
-  const player=useVideoPlayer(url,instance=>{instance.loop=false})
-  return <VideoView player={player} nativeControls contentFit="contain" style={mobile.resultVideo}/>
+function ChatList({ sessions, models, theme, onOpen, onArchive }: {
+  sessions: ApiSession[]
+  models: ApiModel[]
+  theme: Theme
+  onOpen: (model: ApiModel, sessionId: string) => void
+  onArchive: (id: string) => void
+}) {
+  if (!sessions.length) return <Empty title="No chats yet" text="Start one from the Models tab. Each chat keeps its own history." />
+  return <View style={{ gap: space.sm }}>
+    {sessions.map(item => {
+      const model = models.find(entry => entry.id === item.modelId)
+      if (!model) return null
+      return <Card key={item.id} style={{ padding: space.lg, flexDirection: 'row', alignItems: 'center', gap: space.md }}>
+        <TouchableOpacity activeOpacity={0.8} onPress={() => onOpen(model, item.id)} style={{ flexDirection: 'row', alignItems: 'center', gap: space.md, flex: 1 }}>
+          <KindBadge kind={model.kind as Kind} size={30} />
+          <View style={sheet.grow}>
+            <Text numberOfLines={1} style={{ fontSize: 14, fontWeight: '600', color: theme.text }}>{item.title}</Text>
+            <Text numberOfLines={1} style={{ fontSize: 12, color: theme.textFaint, marginTop: 2 }}>
+              {model.name} · {item.generationCount || 0} {item.generationCount === 1 ? 'run' : 'runs'} · {relativeTime(item.updatedAt)}
+            </Text>
+          </View>
+        </TouchableOpacity>
+        <TouchableOpacity accessibilityLabel={`Remove ${item.title}`} onPress={() => onArchive(item.id)} style={{ padding: space.sm }}>
+          <Trash2 size={15} color={theme.textFaint} />
+        </TouchableOpacity>
+      </Card>
+    })}
+  </View>
 }
 
-function Login({ onLogin }: { onLogin: (email:string,password:string) => Promise<void> }) {
-  const [email,setEmail]=useState('')
-  const [password,setPassword]=useState('')
-  const [loading,setLoading]=useState(false)
-  const [error,setError]=useState('')
-  const ready=email.trim().length>0&&password.trim().length>0
-  const submit=async()=>{setLoading(true);setError('');try{await onLogin(email,password)}catch(reason){setError(reason instanceof Error?reason.message:'Login failed.')}finally{setLoading(false)}}
-  return <SafeAreaView style={styles.safe}><View style={styles.login}>
-    <Text style={styles.kicker}>CRESCO LABS</Text><Text style={styles.loginTitle}>Welcome back.</Text>
-    <Text style={styles.loginSub}>Log in to continue to your team’s private model studio.</Text>
-    <Text style={styles.label}>EMAIL ADDRESS</Text><TextInput style={styles.input} value={email} onChangeText={setEmail} placeholder="you@company.com" placeholderTextColor={colors.muted} selectionColor={colors.sage} autoCapitalize="none" keyboardType="email-address"/>
-    <Text style={styles.label}>PASSWORD</Text><TextInput style={styles.input} value={password} onChangeText={setPassword} placeholder="Enter your password" placeholderTextColor={colors.muted} selectionColor={colors.sage} secureTextEntry/>
-    {error?<Text style={styles.loginNote}>{error}</Text>:null}
-    <TouchableOpacity disabled={!ready||loading} style={[styles.loginButton,(!ready||loading)&&styles.generateDisabled]} onPress={submit}><Text style={styles.loginButtonText}>{loading?'Logging in…':'Log in'}</Text></TouchableOpacity>
-    <Text style={styles.loginNote}>Access is invite-only. Your account is created and approved by an admin.</Text>
-  </View></SafeAreaView>
+function UsageView({ usage, theme }: { usage: UsageSummary; theme: Theme }) {
+  const limit = Number(usage.budget?.workspaceMonthlyLimitNanoUsd || 0)
+  const committed = Number(usage.monthlyCommittedNanoUsd || 0)
+  const percent = limit > 0 ? Math.min(100, Math.round((committed / limit) * 100)) : 0
+  return <View style={{ gap: space.sm }}>
+    <Card style={{ padding: space.lg }}>
+      <Text style={{ fontSize: 12, color: theme.textFaint }}>Tracked team spend</Text>
+      <Text style={{ fontSize: 30, fontWeight: '700', color: theme.text, marginVertical: 6, letterSpacing: -0.6 }}>{money(usage.spendNanoUsd)}</Text>
+      <Text style={{ fontSize: 12, color: theme.textFaint }}>{usage.calls.toLocaleString()} generations across {usage.byModel.length} models</Text>
+    </Card>
+    {limit > 0 && <Card style={{ padding: space.lg }}>
+      <View style={sheet.rowBetween}>
+        <Text style={{ fontSize: 13, fontWeight: '600', color: theme.text, flex: 1 }}>Monthly budget</Text>
+        <Text style={{ fontSize: 12, color: theme.textFaint }}>{money(committed)} / {money(limit)}</Text>
+      </View>
+      <View style={{ height: 5, borderRadius: radius.pill, backgroundColor: theme.bgSunken, marginTop: space.md, overflow: 'hidden' }}>
+        <View style={{ width: `${percent}%`, height: '100%', backgroundColor: percent >= 100 ? theme.danger : percent >= 80 ? theme.warn : theme.accent }} />
+      </View>
+    </Card>}
+    {usage.byModel.map(item => <Card key={item.modelId} style={{ padding: space.lg, flexDirection: 'row', alignItems: 'center' }}>
+      <View style={sheet.grow}>
+        <Text style={{ fontSize: 14, fontWeight: '600', color: theme.text }}>{item.name}</Text>
+        <Text style={{ fontSize: 12, color: theme.textFaint, marginTop: 2 }}>{item.calls} runs · {item.provider}</Text>
+      </View>
+      <Text style={{ fontSize: 14, fontWeight: '600', color: theme.text }}>{money(item.spendNanoUsd)}</Text>
+    </Card>)}
+    {!usage.byModel.length && <Empty title="No spend yet" text="Usage appears after your first completed generation." />}
+  </View>
 }
 
-const styles = StyleSheet.create({safe:{flex:1,backgroundColor:colors.background},splash:{flex:1,alignItems:'center',justifyContent:'center',gap:16},content:{padding:24,paddingTop:32,paddingBottom:64},header:{flexDirection:'row',justifyContent:'space-between',alignItems:'flex-start',gap:14},kicker:{fontSize:12,letterSpacing:1.7,fontWeight:'800',color:colors.muted},title:{fontSize:34,fontWeight:'800',color:colors.ink,marginTop:14,letterSpacing:-1},star:{color:colors.coral},sub:{fontSize:15,color:colors.muted,marginTop:8,lineHeight:22},avatar:{width:44,height:44,borderRadius:22,backgroundColor:'#D8AA98',alignItems:'center',justifyContent:'center'},pillNav:{alignSelf:'center',flexDirection:'row',padding:5,backgroundColor:colors.glass,borderColor:colors.line,borderWidth:1,borderRadius:radius.pill,marginTop:30,marginBottom:38},navItem:{flexDirection:'row',alignItems:'center',justifyContent:'center',gap:6,minHeight:44,paddingHorizontal:14,paddingVertical:11,borderRadius:radius.pill},navSelected:{backgroundColor:colors.glassStrong},navText:{fontSize:13,fontWeight:'600',color:colors.muted},sectionHead:{marginBottom:18},sectionTitle:{fontSize:23,fontWeight:'800',color:colors.ink},sectionSub:{fontSize:14,color:colors.muted,marginTop:6,lineHeight:20},card:{flexDirection:'row',alignItems:'center',gap:15,padding:18,minHeight:88,marginBottom:14,borderRadius:radius.card,backgroundColor:colors.glass,borderWidth:1,borderColor:colors.line},cardDisabled:{opacity:.58},modelIcon:{width:50,height:50,borderRadius:15,alignItems:'center',justifyContent:'center'},cardCopy:{flex:1},modelType:{fontSize:11,letterSpacing:1.05,fontWeight:'700',color:colors.muted},modelName:{fontSize:18,fontWeight:'800',color:colors.ink,marginTop:5},modelDesc:{fontSize:13,color:colors.muted,marginTop:5,lineHeight:19},empty:{paddingTop:40},login:{margin:18,padding:28,borderRadius:24,backgroundColor:colors.glass,borderWidth:1,borderColor:colors.line,marginTop:60},loginTitle:{fontSize:36,fontWeight:'800',color:colors.ink,marginTop:28,letterSpacing:-1},loginSub:{fontSize:15,color:colors.muted,lineHeight:22,marginTop:9,marginBottom:24},label:{fontSize:11,letterSpacing:1.1,fontWeight:'800',color:colors.muted,marginTop:18,marginBottom:8},input:{minHeight:54,color:colors.ink,backgroundColor:colors.glassStrong,borderWidth:1,borderColor:colors.line,borderRadius:13,paddingHorizontal:16,paddingVertical:14,fontSize:16},loginButton:{minHeight:54,marginTop:27,padding:16,alignItems:'center',justifyContent:'center',backgroundColor:colors.ink,borderRadius:13},loginButtonText:{color:'#fff',fontSize:15,fontWeight:'800'},loginNote:{fontSize:13,color:colors.muted,lineHeight:19,marginTop:20},back:{fontSize:14,fontWeight:'700',color:colors.muted,marginBottom:30},workspaceIcon:{width:58,height:58,borderRadius:18,alignItems:'center',justifyContent:'center',marginBottom:20},workspaceTitle:{fontSize:34,fontWeight:'800',color:colors.ink,marginTop:14,marginBottom:8,letterSpacing:-.8},options:{flexDirection:'row',flexWrap:'wrap',gap:9,marginTop:25},optionsTouchable:{minHeight:44,justifyContent:'center',paddingHorizontal:14,paddingVertical:11,backgroundColor:colors.glass,borderColor:colors.line,borderWidth:1,borderRadius:12},optionsText:{fontSize:14,fontWeight:'700',color:colors.ink},prompt:{minHeight:190,color:colors.ink,backgroundColor:colors.glassStrong,borderColor:colors.line,borderWidth:1,borderRadius:radius.card,padding:18,fontSize:16,lineHeight:23,marginTop:18,textAlignVertical:'top'},workspaceFooter:{flexDirection:'row',alignItems:'center',justifyContent:'space-between',gap:14,marginTop:21},cost:{flex:1,fontSize:13,color:colors.muted},generate:{minHeight:50,flexDirection:'row',alignItems:'center',justifyContent:'center',gap:8,backgroundColor:colors.ink,paddingHorizontal:18,paddingVertical:14,borderRadius:13},generateDisabled:{opacity:.45},generateText:{fontSize:14,color:'#fff',fontWeight:'800'}})
-const mobile=StyleSheet.create({listRow:{flexDirection:'row',alignItems:'center',gap:13,padding:17,minHeight:72,marginTop:12,borderRadius:radius.card,backgroundColor:colors.glass,borderWidth:1,borderColor:colors.line},historyDot:{width:10,height:10,borderRadius:5,backgroundColor:colors.sage},actionTitle:{fontSize:15,fontWeight:'800',color:colors.ink},actionMeta:{fontSize:13,color:colors.muted,marginTop:5,lineHeight:18},responseText:{fontSize:14,color:colors.ink,lineHeight:21,marginTop:11},chevron:{fontSize:25,color:colors.muted},chevronOpen:{transform:[{rotate:'90deg'}]},metricCard:{padding:23,borderRadius:radius.card,backgroundColor:colors.glass,borderWidth:1,borderColor:colors.line,marginTop:22,marginBottom:19},metricLabel:{fontSize:11,letterSpacing:1.1,fontWeight:'700',color:colors.muted},metricValue:{fontSize:36,fontWeight:'800',color:colors.ink,marginVertical:10},usageRow:{flexDirection:'row',alignItems:'center',paddingVertical:18,borderBottomWidth:1,borderBottomColor:'#ffffffaa'},usageCost:{fontSize:15,fontWeight:'800',color:colors.ink},settingIcon:{width:44,height:44,borderRadius:13,alignItems:'center',justifyContent:'center',backgroundColor:'#e7f1dc'},uploadButton:{minHeight:50,flexDirection:'row',alignItems:'center',gap:9,paddingVertical:15},uploadText:{fontSize:14,color:colors.muted},referenceRow:{flexDirection:'row',alignItems:'center',padding:14,marginBottom:9,borderRadius:13,backgroundColor:colors.glass,borderWidth:1,borderColor:colors.line},resultCard:{flexDirection:'row',alignItems:'center',gap:13,padding:18,marginTop:20,borderRadius:radius.card,backgroundColor:'#E7F1DC',borderWidth:1,borderColor:'#CFE2BE'},failedCard:{backgroundColor:'#F8E6E1',borderColor:'#EBCBC3'},processingDot:{width:12,height:12,borderRadius:6,backgroundColor:'#70964F'},resultTitle:{fontSize:16,fontWeight:'800',color:colors.ink},resultMeta:{fontSize:13,color:colors.muted,lineHeight:19,marginTop:4},inlineResult:{padding:18,marginTop:20,marginBottom:17,borderRadius:radius.card,backgroundColor:colors.glassStrong,borderWidth:1,borderColor:colors.line},resultHeading:{flexDirection:'row',alignItems:'center',gap:11,marginBottom:15},outputText:{fontSize:16,color:colors.ink,lineHeight:24},resultImage:{width:'100%',height:320,backgroundColor:'#DDE4DA',borderRadius:15},resultVideo:{width:'100%',height:260,backgroundColor:'#101313',borderRadius:15},resultActions:{flexDirection:'row',gap:10,marginTop:15},downloadButton:{flex:1,minHeight:48,flexDirection:'row',alignItems:'center',justifyContent:'center',gap:7,padding:13,backgroundColor:colors.ink,borderRadius:12},downloadText:{fontSize:13,fontWeight:'800',color:'#fff'},openButton:{flex:1,minHeight:48,flexDirection:'row',alignItems:'center',justifyContent:'center',gap:7,padding:13,backgroundColor:colors.glass,borderWidth:1,borderColor:colors.line,borderRadius:12},openText:{fontSize:13,fontWeight:'800',color:colors.ink}})
+function SettingsView({ name, theme, onSignOut }: { name: string; theme: Theme; onSignOut: () => void }) {
+  const { choice, setChoice } = useThemeChoice()
+  return <View style={{ gap: space.sm }}>
+    <Card style={{ padding: space.lg }}>
+      <Text style={{ fontSize: 12, color: theme.textFaint }}>Signed in as</Text>
+      <Text style={{ fontSize: 16, fontWeight: '600', color: theme.text, marginTop: 4 }}>{name}</Text>
+    </Card>
+
+    <Card style={{ padding: space.lg }}>
+      <Text style={{ fontSize: 14, fontWeight: '600', color: theme.text }}>Appearance</Text>
+      <Text style={{ fontSize: 12, color: theme.textFaint, marginTop: 2, marginBottom: space.md }}>Applies to this device.</Text>
+      <View style={{ flexDirection: 'row', padding: 3, gap: 3, borderRadius: radius.md, backgroundColor: theme.bgSunken }}>
+        {(['system', 'light', 'dark'] as const).map(value => (
+          <TouchableOpacity
+            key={value}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: choice === value }}
+            onPress={() => setChoice(value as ThemeChoice)}
+            style={{ flex: 1, minHeight: 36, alignItems: 'center', justifyContent: 'center', borderRadius: radius.sm, backgroundColor: choice === value ? theme.bgRaised : 'transparent' }}
+          >
+            <Text style={{ fontSize: 13, fontWeight: choice === value ? '600' : '400', color: choice === value ? theme.text : theme.textMuted, textTransform: 'capitalize' }}>{value}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+    </Card>
+
+    <Card style={{ padding: space.lg }}>
+      <Text style={{ fontSize: 13, color: theme.textMuted, lineHeight: 20 }}>
+        Account details and model access are managed by your workspace administrator.
+      </Text>
+    </Card>
+
+    <Button label="Sign out" tone="danger" onPress={onSignOut} style={{ marginTop: space.sm }} />
+  </View>
+}
+
+function ThreadScreen({
+  model, sessionId, onBack, onNew, onCreated, onRefresh,
+}: {
+  model: ApiModel
+  sessionId?: string
+  onBack: () => void
+  onNew: () => void
+  onCreated: (generation: ApiGeneration) => void
+  onRefresh: () => Promise<void>
+}) {
+  const theme = useTheme()
+  const kind = model.kind as Kind
+  const [turns, setTurns] = useState<ApiGeneration[]>([])
+  const [prompt, setPrompt] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [aspect, setAspect] = useState(kind === 'image' ? '1:1' : '16:9')
+  const [duration, setDuration] = useState('10 seconds')
+  const [references, setReferences] = useState<ApiUpload[]>([])
+  const [uploading, setUploading] = useState(false)
+  const [thread, setThread] = useState<string | undefined>(sessionId)
+
+  useEffect(() => {
+    if (!sessionId) return
+    let alive = true
+    void getSession(sessionId)
+      .then(data => { if (alive) setTurns(data.generations) })
+      .catch(() => { if (alive) setError('This chat could not be loaded.') })
+    return () => { alive = false }
+  }, [sessionId])
+
+  // Reading a generation advances it server-side, so polling both refreshes the
+  // view and moves queued work along.
+  const waiting = turns.some(item => item.status === 'queued')
+  useEffect(() => {
+    if (!waiting) return
+    let alive = true
+    const timer = setInterval(async () => {
+      const queued = turns.filter(item => item.status === 'queued').slice(0, 3)
+      for (const item of queued) {
+        try {
+          const next = (await getGeneration(item.id)).generation
+          if (!alive) return
+          setTurns(items => items.map(entry => (entry.id === next.id ? next : entry)))
+          onCreated(next)
+        } catch {
+          /* a failed poll simply retries on the next tick */
+        }
+      }
+    }, 2500)
+    return () => { alive = false; clearInterval(timer) }
+  }, [waiting, turns, onCreated])
+
+  const attach = async () => {
+    setError('')
+    try {
+      const picked = await DocumentPicker.getDocumentAsync({
+        type: kind === 'image' ? 'image/*' : ['image/*', 'video/*', 'audio/*'],
+        multiple: true, copyToCacheDirectory: true,
+      })
+      if (picked.canceled) return
+      const room = Math.max(0, 5 - references.length)
+      if (!room) return setError('You can attach up to five references.')
+      setUploading(true)
+      const uploaded = await Promise.all(picked.assets.slice(0, room).map(asset =>
+        uploadMobileReference({ uri: asset.uri, name: asset.name, mimeType: asset.mimeType })))
+      setReferences(items => [...items, ...uploaded.map(item => item.upload)])
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'That reference could not be uploaded.')
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  // Feeding a finished result back in is how an existing image or video is edited.
+  const reuse = async (generation: ApiGeneration) => {
+    if (!generation.resultUrl) return
+    setError(''); setUploading(true)
+    try {
+      const extension = generation.kind === 'video' ? 'mp4' : 'png'
+      const target = `${FileSystem.cacheDirectory}reuse-${generation.id}.${extension}`
+      const downloaded = await FileSystem.downloadAsync(generation.resultUrl, target)
+      const uploaded = await uploadMobileReference({
+        uri: downloaded.uri,
+        name: `cresco-${generation.id}.${extension}`,
+        mimeType: generation.kind === 'video' ? 'video/mp4' : 'image/png',
+      })
+      setReferences(items => [...items.filter(item => item.id !== uploaded.upload.id), uploaded.upload].slice(0, 5))
+      setPrompt(current => current || 'Edit this: ')
+    } catch {
+      setError('That result could not be reused. Download it and attach it manually.')
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const generate = async () => {
+    if (!prompt.trim() || busy) return
+    setBusy(true); setError('')
+    try {
+      const options: Record<string, string> = kind === 'text' ? {} : kind === 'video' ? { aspect, duration } : { aspect }
+      const created = (await submitGeneration(model.id, prompt.trim(), options, references.map(item => item.id), thread)).generation
+      setTurns(items => [...items, created])
+      onCreated(created)
+      if (!thread && created.sessionId) setThread(created.sessionId)
+      setPrompt(''); setReferences([])
+      void onRefresh().catch(() => undefined)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'The request could not be sent.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <SafeAreaView style={[sheet.screen, { backgroundColor: theme.bg }]}>
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.sm, paddingHorizontal: space.sm, paddingVertical: space.sm, borderBottomWidth: 1, borderBottomColor: theme.border }}>
+      <TouchableOpacity accessibilityRole="button" accessibilityLabel="Back" onPress={onBack} style={{ width: 40, height: 40, alignItems: 'center', justifyContent: 'center' }}>
+        <ChevronLeft size={22} color={theme.textMuted} />
+      </TouchableOpacity>
+      <View style={sheet.grow}>
+        <Text style={{ fontSize: 15, fontWeight: '600', color: theme.text }}>{model.name}</Text>
+        <Text style={{ fontSize: 12, color: theme.textFaint }}>{model.provider}</Text>
+      </View>
+      <TouchableOpacity accessibilityRole="button" accessibilityLabel="New chat" onPress={onNew} style={{ flexDirection: 'row', alignItems: 'center', gap: 5, minHeight: 36, paddingHorizontal: space.md, borderRadius: radius.md, borderWidth: 1, borderColor: theme.border }}>
+        <Plus size={14} color={theme.textMuted} />
+        <Text style={{ fontSize: 13, fontWeight: '500', color: theme.textMuted }}>New</Text>
+      </TouchableOpacity>
+    </View>
+
+    <KeyboardAvoidingView style={sheet.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={8}>
+      <ScrollView contentContainerStyle={sheet.scroll}>
+        {turns.length ? <View style={{ gap: space.md }}>
+          {turns.map(item => <Card key={item.id} style={{ padding: space.lg, gap: space.sm }}>
+            <View style={sheet.rowBetween}>
+              <Text style={{ fontSize: 12, color: theme.textFaint, flex: 1 }}>{relativeTime(item.createdAt)}</Text>
+              {item.providerLatencyMs ? <Text style={{ fontSize: 12, color: theme.textFaint }}>{elapsed(item.providerLatencyMs)}</Text> : null}
+              <StatusPill status={item.status} />
+            </View>
+            <Text style={{ fontSize: 14, color: theme.textMuted, lineHeight: 21 }}>{item.prompt}</Text>
+            {item.status === 'queued' && <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.sm }}>
+              <ActivityIndicator size="small" color={theme.accent} />
+              <Text style={{ fontSize: 13, color: theme.textFaint }}>Working{item.queuedForMs ? ` · ${elapsed(item.queuedForMs)}` : ''}</Text>
+            </View>}
+            {item.error ? <ErrorNote>{item.error}</ErrorNote> : null}
+            {item.outputText ? <Text selectable style={{ fontSize: 15, color: theme.text, lineHeight: 23 }}>{item.outputText}</Text> : null}
+            {item.resultUrl ? <ResultMedia generation={item} theme={theme} onReuse={() => void reuse(item)} /> : null}
+          </Card>)}
+        </View> : <Empty title={`Start with ${model.name}`} text={kind === 'text' ? 'Write a prompt below and the response appears here.' : 'Describe what you want and the result appears here.'} />}
+      </ScrollView>
+
+      <View style={{ padding: space.md, gap: space.sm, borderTopWidth: 1, borderTopColor: theme.border, backgroundColor: theme.bgSubtle }}>
+        {error ? <ErrorNote>{error}</ErrorNote> : null}
+        {references.length > 0 && <View style={{ gap: 6 }}>
+          {references.map(reference => <View key={reference.id} style={{ flexDirection: 'row', alignItems: 'center', gap: space.sm, padding: space.sm, borderRadius: radius.md, backgroundColor: theme.bgSunken }}>
+            <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: theme.textMuted }}>{reference.fileName}</Text>
+            <TouchableOpacity accessibilityLabel={`Remove ${reference.fileName}`} onPress={() => setReferences(items => items.filter(item => item.id !== reference.id))}>
+              <X size={14} color={theme.textFaint} />
+            </TouchableOpacity>
+          </View>)}
+        </View>}
+        {kind !== 'text' && <View style={{ flexDirection: 'row', gap: space.sm }}>
+          <Chip label={aspect} theme={theme} onPress={() => setAspect(value => (value === '16:9' ? '9:16' : value === '9:16' ? '1:1' : '16:9'))} />
+          {kind === 'video' && <Chip label={duration} theme={theme} onPress={() => setDuration(value => (value === '5 seconds' ? '10 seconds' : value === '10 seconds' ? '15 seconds' : '5 seconds'))} />}
+        </View>}
+        <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: space.sm }}>
+          {kind !== 'text' && <TouchableOpacity
+            accessibilityLabel="Add reference"
+            disabled={uploading || references.length >= 5}
+            onPress={attach}
+            style={{ width: 44, height: 44, alignItems: 'center', justifyContent: 'center', borderRadius: radius.md, borderWidth: 1, borderColor: theme.border, backgroundColor: theme.bgRaised }}
+          >
+            <Paperclip size={17} color={theme.textMuted} />
+          </TouchableOpacity>}
+          <TextInput
+            multiline
+            value={prompt}
+            onChangeText={setPrompt}
+            placeholder={kind === 'text' ? `Message ${model.name}…` : 'Describe what you want…'}
+            placeholderTextColor={theme.textFaint}
+            style={{
+              flex: 1, minHeight: 44, maxHeight: 130, color: theme.text, fontSize: 15, lineHeight: 21,
+              paddingHorizontal: space.md, paddingTop: 12, paddingBottom: 12,
+              backgroundColor: theme.bgRaised, borderWidth: 1, borderColor: theme.border, borderRadius: radius.md,
+            }}
+          />
+          <TouchableOpacity
+            accessibilityLabel="Send"
+            disabled={!prompt.trim() || busy || uploading}
+            onPress={generate}
+            style={{
+              width: 44, height: 44, alignItems: 'center', justifyContent: 'center', borderRadius: radius.md,
+              backgroundColor: theme.accent, opacity: !prompt.trim() || busy || uploading ? 0.45 : 1,
+            }}
+          >
+            {busy ? <ActivityIndicator size="small" color={theme.accentText} /> : <Send size={17} color={theme.accentText} />}
+          </TouchableOpacity>
+        </View>
+      </View>
+    </KeyboardAvoidingView>
+  </SafeAreaView>
+}
+
+function Chip({ label, onPress, theme }: { label: string; onPress: () => void; theme: Theme }) {
+  return <TouchableOpacity onPress={onPress} style={{ minHeight: 34, justifyContent: 'center', paddingHorizontal: space.md, borderRadius: radius.pill, borderWidth: 1, borderColor: theme.border, backgroundColor: theme.bgRaised }}>
+    <Text style={{ fontSize: 12, fontWeight: '500', color: theme.textMuted }}>{label}</Text>
+  </TouchableOpacity>
+}
+
+function ResultMedia({ generation, theme, onReuse }: { generation: ApiGeneration; theme: Theme; onReuse?: () => void }) {
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
+  const save = async () => {
+    if (!generation.resultUrl) return
+    setSaving(true); setSaveError('')
+    try {
+      const clean = generation.resultUrl.split('?')[0]
+      const extension = clean.split('.').pop()?.slice(0, 5) || (generation.kind === 'video' ? 'mp4' : 'png')
+      const target = `${FileSystem.cacheDirectory}cresco-${generation.id}.${extension}`
+      const downloaded = await FileSystem.downloadAsync(generation.resultUrl, target)
+      if (!(await Sharing.isAvailableAsync())) throw new Error('Saving is not available on this device.')
+      await Sharing.shareAsync(downloaded.uri, { dialogTitle: 'Save Cresco result' })
+    } catch (reason) {
+      setSaveError(reason instanceof Error ? reason.message : 'That result could not be saved.')
+    } finally {
+      setSaving(false)
+    }
+  }
+  return <View style={{ gap: space.sm }}>
+    {generation.kind === 'image'
+      ? <Image source={{ uri: generation.resultUrl! }} resizeMode="contain" style={{ width: '100%', height: 280, borderRadius: radius.md, backgroundColor: theme.bgSunken }} />
+      : <ResultVideo url={generation.resultUrl!} background={theme.bgSunken} />}
+    {saveError ? <ErrorNote>{saveError}</ErrorNote> : null}
+    <View style={{ flexDirection: 'row', gap: space.sm }}>
+      <Button label={saving ? 'Preparing…' : 'Save'} tone="secondary" icon={ArrowDownToLine} busy={saving} onPress={save} style={{ flex: 1 }} />
+      {onReuse && <Button label="Use as reference" tone="secondary" onPress={onReuse} style={{ flex: 1 }} />}
+    </View>
+  </View>
+}
+
+function ResultVideo({ url, background }: { url: string; background: string }) {
+  const player = useVideoPlayer(url, instance => { instance.loop = false })
+  return <VideoView player={player} nativeControls contentFit="contain" style={{ width: '100%', height: 240, borderRadius: radius.md, backgroundColor: background }} />
+}
+
+function SignIn({ onSignedIn }: { onSignedIn: (email: string, password: string) => Promise<void> }) {
+  const theme = useTheme()
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const ready = email.trim().length > 0 && password.length > 0
+
+  const submit = async () => {
+    setBusy(true); setError('')
+    try { await onSignedIn(email.trim(), password) }
+    catch (reason) { setError(reason instanceof Error ? reason.message : 'Sign in failed.') }
+    finally { setBusy(false) }
+  }
+
+  const input = {
+    minHeight: 48, color: theme.text, backgroundColor: theme.bgRaised, borderWidth: 1, borderColor: theme.border,
+    borderRadius: radius.md, paddingHorizontal: space.md, fontSize: 16,
+  }
+
+  return <SafeAreaView style={[sheet.screen, { backgroundColor: theme.bgSubtle }]}>
+    <KeyboardAvoidingView style={[sheet.screen, { justifyContent: 'center', padding: space.xl }]} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <Text style={{ fontSize: 24, fontWeight: '700', color: theme.text, letterSpacing: -0.4 }}>Sign in</Text>
+      <Text style={{ fontSize: 14, color: theme.textMuted, marginTop: 6, marginBottom: space.xl }}>Your team's private model workspace.</Text>
+
+      <Text style={{ fontSize: 12, fontWeight: '500', color: theme.textMuted, marginBottom: 6 }}>Email</Text>
+      <TextInput style={input} value={email} onChangeText={setEmail} placeholder="you@company.com" placeholderTextColor={theme.textFaint} autoCapitalize="none" autoComplete="email" keyboardType="email-address" />
+
+      <Text style={{ fontSize: 12, fontWeight: '500', color: theme.textMuted, marginTop: space.lg, marginBottom: 6 }}>Password</Text>
+      <TextInput style={input} value={password} onChangeText={setPassword} secureTextEntry autoComplete="current-password" placeholderTextColor={theme.textFaint} />
+
+      {error ? <View style={{ marginTop: space.lg }}><ErrorNote>{error}</ErrorNote></View> : null}
+
+      <Button label={busy ? 'Signing in…' : 'Sign in'} busy={busy} disabled={!ready} onPress={submit} style={{ marginTop: space.xl }} />
+      <Text style={{ fontSize: 12, color: theme.textFaint, lineHeight: 18, marginTop: space.lg }}>
+        Access is invite only. An administrator creates and approves every account.
+      </Text>
+    </KeyboardAvoidingView>
+  </SafeAreaView>
+}

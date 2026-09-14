@@ -22,6 +22,9 @@ export type ApiModel = {
   status: 'active' | 'beta' | 'disabled'
   endpoint?: string | null
   priceNanoUsd?: number
+  thinkingMode?: 'disabled' | 'enabled' | 'auto'
+  textApi?: 'chat_completions' | 'responses'
+  contextTurns?: number
   credentialConfigured?: boolean
   adapterConfigured?: boolean
   executionReady?: boolean
@@ -43,6 +46,9 @@ export type ApiGeneration = {
   resultUrl?: string | null
   outputText?: string | null
   error?: string | null
+  providerLatencyMs?: number | null
+  queuedForMs?: number | null
+  sessionId?: string | null
   completedAt?: string | null
   references?: ApiUpload[]
   createdAt: string
@@ -167,11 +173,138 @@ export async function getWorkspaceData() {
   return { models: models.models, generations: history.generations, usage }
 }
 
-export async function submitGeneration(modelId: string, prompt: string, options: Record<string, string> = {}, referenceIds: string[] = []) {
+export type ApiSession = {
+  id: string
+  modelId: string
+  title: string
+  createdAt: string
+  updatedAt: string
+  generationCount?: number
+}
+
+export async function submitGeneration(
+  modelId: string,
+  prompt: string,
+  options: Record<string, string> = {},
+  referenceIds: string[] = [],
+  sessionId?: string,
+) {
   return request<{ generation: ApiGeneration }>('/v1/generations', {
     method: 'POST',
-    body: JSON.stringify({ modelId, prompt, options, referenceIds }),
+    body: JSON.stringify({ modelId, prompt, options, referenceIds, sessionId }),
   })
+}
+
+export async function listSessions(modelId?: string) {
+  const query = modelId ? `?modelId=${encodeURIComponent(modelId)}` : ''
+  return request<{ sessions: ApiSession[] }>(`/v1/sessions${query}`)
+}
+
+export async function createSession(modelId: string, title?: string) {
+  return request<{ session: ApiSession }>('/v1/sessions', { method: 'POST', body: JSON.stringify({ modelId, title }) })
+}
+
+export async function getSession(id: string) {
+  return request<{ session: ApiSession; generations: ApiGeneration[] }>(`/v1/sessions/${encodeURIComponent(id)}`)
+}
+
+export async function renameSession(id: string, title: string) {
+  return request<{ session: ApiSession }>(`/v1/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ title }) })
+}
+
+export async function archiveSession(id: string) {
+  return request<{ archived: boolean }>(`/v1/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+type GenerationStreamHandlers = {
+  onMeta?: (generation: ApiGeneration, session: ApiSession | null) => void
+  onDelta?: (text: string) => void
+}
+
+// Text models stream so the member sees output at first token instead of waiting
+// for the whole completion. Resolves with the finalised generation record.
+export async function streamGeneration(
+  modelId: string,
+  prompt: string,
+  options: Record<string, string> = {},
+  referenceIds: string[] = [],
+  handlers: GenerationStreamHandlers = {},
+  signal?: AbortSignal,
+  sessionId?: string,
+): Promise<ApiGeneration> {
+  const token = sessionStorage.getItem('cresco_token')
+  const response = await fetch(API_URL + '/v1/generations', {
+    method: 'POST',
+    signal,
+    headers: {
+      'content-type': 'application/json',
+      accept: 'text/event-stream',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ modelId, prompt, options, referenceIds, sessionId, stream: true }),
+  })
+  if (response.status === 401) {
+    clearSession()
+    throw new Error('Your session has expired. Please log in again.')
+  }
+  if (!response.ok || !response.body) {
+    const data = await response.json().catch(() => ({}))
+    throw new Error(generationErrorMessage(String(data.error || 'generation_failed')))
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let event = ''
+  let final: ApiGeneration | null = null
+  let failure = ''
+
+  const handleFrame = (name: string, payload: string) => {
+    if (!payload) return
+    let data: any
+    try {
+      data = JSON.parse(payload)
+    } catch {
+      return
+    }
+    if (name === 'meta' && data.generation) handlers.onMeta?.(data.generation, data.session || null)
+    else if (name === 'delta' && typeof data.text === 'string') handlers.onDelta?.(data.text)
+    else if (name === 'done' && data.generation) final = data.generation
+    else if (name === 'error') failure = String(data.error || 'generation_failed')
+  }
+
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let index = buffer.indexOf('\n')
+    while (index >= 0) {
+      const line = buffer.slice(0, index).replace(/\r$/, '')
+      buffer = buffer.slice(index + 1)
+      index = buffer.indexOf('\n')
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) handleFrame(event, line.slice(5).trim())
+      else if (!line) event = ''
+    }
+  }
+
+  if (failure) throw new Error(generationErrorMessage(failure))
+  if (!final) throw new Error('The model connection closed before it finished responding.')
+  return final
+}
+
+export function generationErrorMessage(code: string): string {
+  const timeout = code.match(/^provider_timeout_after_(\d+)s$/)
+  if (timeout) return `The model did not respond within ${timeout[1]} seconds. Try a shorter prompt, or ask an admin to raise the text timeout.`
+  const messages: Record<string, string> = {
+    provider_empty_response: 'The model returned an empty response.',
+    provider_credential_required: 'This model has no provider key configured yet.',
+    provider_adapter_required: 'This provider is not supported by the backend yet.',
+    model_not_ready: 'This model is missing an endpoint or a provider key.',
+    generation_limit_exceeded: 'This request costs more than the per-generation limit.',
+    workspace_budget_exceeded: 'The workspace monthly budget has been reached.',
+  }
+  return messages[code] || code
 }
 
 export async function uploadReference(file: File) {

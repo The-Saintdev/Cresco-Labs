@@ -18,9 +18,11 @@ export type MobileSession = {
 }
 
 export type ApiUser = MobileSession['user'] & { createdAt: string }
-export type ApiModel = { id: string; name: string; description?: string; provider: string; kind: 'text' | 'image' | 'video'; status: 'active' | 'beta' | 'disabled'; endpoint?: string | null; priceNanoUsd?: number; createdAt: string; credentialConfigured?: boolean; adapterConfigured?: boolean; executionReady?: boolean }
+export type ThinkingMode = 'disabled' | 'enabled' | 'auto'
+export type TextApi = 'chat_completions' | 'responses'
+export type ApiModel = { id: string; name: string; description?: string; provider: string; kind: 'text' | 'image' | 'video'; status: 'active' | 'beta' | 'disabled'; endpoint?: string | null; priceNanoUsd?: number; thinkingMode?: ThinkingMode; textApi?: TextApi; contextTurns?: number; createdAt: string; credentialConfigured?: boolean; adapterConfigured?: boolean; executionReady?: boolean }
 export type ApiUpload = { id: string; ownerEmail: string; fileName: string; contentType: string; size: number; createdAt: string }
-export type ApiGeneration = { id: string; userEmail: string; title: string; modelId: string; modelName?: string; modelProvider?: string; kind: 'text' | 'image' | 'video'; prompt: string; status: 'complete' | 'failed' | 'queued'; costNanoUsd: number; costSource?: 'catalog_estimate' | 'pending_reconciliation' | 'provider'; resultUrl?: string | null; outputText?: string | null; error?: string | null; completedAt?: string | null; references?: ApiUpload[]; createdAt: string }
+export type ApiGeneration = { id: string; userEmail: string; title: string; modelId: string; modelName?: string; modelProvider?: string; kind: 'text' | 'image' | 'video'; prompt: string; status: 'complete' | 'failed' | 'queued'; costNanoUsd: number; costSource?: 'catalog_estimate' | 'pending_reconciliation' | 'provider'; resultUrl?: string | null; outputText?: string | null; error?: string | null; providerLatencyMs?: number | null; queuedForMs?: number | null; sessionId?: string | null; completedAt?: string | null; references?: ApiUpload[]; createdAt: string }
 export type ApiBalance = { provider: string; amountNanoUsd: number; source: 'provider' | 'ledger'; syncedAt: string }
 export type ApiProvider = { provider: string; configured: boolean; updatedAt: string }
 export type BudgetPolicy = { workspaceMonthlyLimitNanoUsd: number; perGenerationLimitNanoUsd: number; warnAtPercent: number }
@@ -97,8 +99,26 @@ export async function getMemberWorkspace() {
   return { models: models.models, generations: history.generations, usage }
 }
 
-export async function submitGeneration(modelId: string, prompt: string, options: Record<string, string> = {}, referenceIds: string[] = []) {
-  return request<{ generation: ApiGeneration }>('/v1/generations', { method: 'POST', body: JSON.stringify({ modelId, prompt, options, referenceIds }) })
+export type ApiSession = { id: string; modelId: string; title: string; createdAt: string; updatedAt: string; generationCount?: number }
+
+export async function submitGeneration(modelId: string, prompt: string, options: Record<string, string> = {}, referenceIds: string[] = [], sessionId?: string) {
+  return request<{ generation: ApiGeneration }>('/v1/generations', { method: 'POST', body: JSON.stringify({ modelId, prompt, options, referenceIds, sessionId }) })
+}
+
+export async function listSessions(modelId?: string) {
+  return request<{ sessions: ApiSession[] }>(`/v1/sessions${modelId ? `?modelId=${encodeURIComponent(modelId)}` : ''}`)
+}
+
+export async function getSession(id: string) {
+  return request<{ session: ApiSession; generations: ApiGeneration[] }>(`/v1/sessions/${encodeURIComponent(id)}`)
+}
+
+export async function renameSession(id: string, title: string) {
+  return request<{ session: ApiSession }>(`/v1/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ title }) })
+}
+
+export async function archiveSession(id: string) {
+  return request<{ archived: boolean }>(`/v1/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
 export async function uploadMobileReference(input: { uri: string; name: string; mimeType?: string | null }) {
@@ -136,11 +156,11 @@ export async function createUser(input: { name: string; email: string; password:
   return request<{ user: ApiUser }>('/v1/admin/users', { method: 'POST', body: JSON.stringify(input) })
 }
 
-export async function createModel(input: { name: string; description?: string; provider: string; kind: 'text' | 'image' | 'video'; endpoint?: string; status?: 'active' | 'beta'; apiKey?: string; priceUsd?: number }) {
+export async function createModel(input: { name: string; description?: string; provider: string; kind: 'text' | 'image' | 'video'; endpoint?: string; status?: 'active' | 'beta'; apiKey?: string; priceUsd?: number; thinkingMode?: ThinkingMode; textApi?: TextApi; contextTurns?: number }) {
   return request<{ model: ApiModel }>('/v1/admin/models', { method: 'POST', body: JSON.stringify(input) })
 }
 
-export async function updateModel(id: string, changes: { name?: string; description?: string; provider?: string; kind?: 'text' | 'image' | 'video'; endpoint?: string; priceUsd?: number; apiKey?: string; status?: 'active' | 'beta' | 'disabled' }) {
+export async function updateModel(id: string, changes: { name?: string; description?: string; provider?: string; kind?: 'text' | 'image' | 'video'; endpoint?: string; priceUsd?: number; apiKey?: string; status?: 'active' | 'beta' | 'disabled'; thinkingMode?: ThinkingMode; textApi?: TextApi; contextTurns?: number }) {
   return request<{ model: ApiModel }>(`/v1/admin/models/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(changes) })
 }
 
