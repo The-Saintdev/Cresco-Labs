@@ -153,6 +153,19 @@ function providerTimeoutMs(env, kind, streaming = false) {
   return positiveInt(env.CRESCO_TEXT_TIMEOUT_MS, DEFAULT_TEXT_TIMEOUT_MS)
 }
 
+const DEFAULT_MAX_QUEUED_MINUTES = { text: 10, image: 20, video: 60 }
+// A job the cron has been re-picking for this long is not going to finish. It is
+// failed with a reason rather than left showing "Processing" forever.
+function maxQueuedMs(env, kind) {
+  const override = positiveInt(env.CRESCO_MAX_QUEUED_MINUTES, 0)
+  const minutes = override || DEFAULT_MAX_QUEUED_MINUTES[kind] || 30
+  return minutes * 60000
+}
+
+// The cron is the safety net behind the queue. A row nothing has touched for this
+// long is processed directly, so a missing or broken queue consumer cannot strand it.
+const STALE_QUEUED_MS = 120000
+
 function requestPath(url) {
   try {
     return new URL(url).pathname
@@ -319,7 +332,13 @@ function safeGeneration(generation) {
     lastProviderAttemptAt: _lastProviderAttemptAt,
     ...safe
   } = generation
-  return { ...safe, outputText: providerOutputText(generation.result), references: (generation.references || []).map(safeUpload) }
+  const queuedForMs = generation.status === 'queued' ? Date.now() - Date.parse(generation.createdAt) : null
+  return {
+    ...safe,
+    outputText: providerOutputText(generation.result),
+    queuedForMs: Number.isFinite(queuedForMs) ? queuedForMs : null,
+    references: (generation.references || []).map(safeUpload),
+  }
 }
 
 function allowedOrigin(request, env) {
@@ -1023,7 +1042,14 @@ async function dispatchGeneration(env, context) {
 
 async function reconcileGeneration(env, context) {
   const { generation, model, credential } = context
-  if (!model || !credential || !generation.providerStatusUrl || !generation.providerResponseUrl) return { done: true }
+  // Without a model, a credential or poll URLs there is nothing left to poll, and
+  // returning quietly would leave the row queued forever. Fail it with a reason.
+  if (!model || !credential || !generation.providerStatusUrl || !generation.providerResponseUrl) {
+    const reason = !model ? 'model_removed' : !credential ? 'provider_credential_removed' : 'provider_poll_urls_missing'
+    await run(env, `UPDATE generations SET status = 'failed', provider_state = 'unrecoverable', error = ?, completed_at = ? WHERE id = ?`,
+      reason, nowIso(), generation.id)
+    return { done: true }
+  }
   try {
     if (providerKey(model.provider) === 'byteplus') {
       const result = await bytePlusRequest(generation.providerStatusUrl, credential, env, { kind: 'poll' })
@@ -1083,7 +1109,15 @@ async function reconcileGeneration(env, context) {
 async function processGeneration(env, id) {
   const context = await generationContext(env, id)
   if (!context || context.generation.status !== 'queued') return { done: true }
-  if (!context.generation.providerStatusUrl) return dispatchGeneration(env, context)
+  const { generation } = context
+  const age = Date.now() - Date.parse(generation.createdAt)
+  const ceiling = maxQueuedMs(env, generation.kind)
+  if (Number.isFinite(age) && age > ceiling) {
+    await run(env, `UPDATE generations SET status = 'failed', provider_state = 'expired', error = ?, completed_at = ? WHERE id = ?`,
+      `generation_expired_after_${Math.round(ceiling / 60000)}m`, nowIso(), generation.id)
+    return { done: true }
+  }
+  if (!generation.providerStatusUrl) return dispatchGeneration(env, context)
   return reconcileGeneration(env, context)
 }
 
@@ -1496,11 +1530,21 @@ async function queueHandler(batch, env) {
 
 async function scheduledHandler(_controller, env, ctx) {
   const work = async () => {
-    const pending = await all(env, "SELECT id FROM generations WHERE workspace_id = ? AND status = 'queued' ORDER BY created_at LIMIT 50", WORKSPACE_ID)
-    if (env.GENERATION_QUEUE && pending.length) {
-      await env.GENERATION_QUEUE.sendBatch(pending.map(item => ({ body: { generationId: item.id } })))
+    const pending = await all(env, `SELECT id, created_at, last_provider_attempt_at FROM generations
+      WHERE workspace_id = ? AND status = 'queued' ORDER BY created_at LIMIT 50`, WORKSPACE_ID)
+    // Anything the queue has not advanced recently is processed here directly, so a
+    // queue that is unavailable, unbound or whose consumer is failing cannot strand
+    // a job. Fresh rows still take the fast queue path.
+    const now = Date.now()
+    const stale = pending.filter(item => now - Date.parse(item.last_provider_attempt_at || item.created_at) > STALE_QUEUED_MS)
+    const fresh = pending.filter(item => !stale.includes(item))
+    if (env.GENERATION_QUEUE && fresh.length) {
+      await env.GENERATION_QUEUE.sendBatch(fresh.map(item => ({ body: { generationId: item.id } })))
     } else {
-      await Promise.all(pending.map(item => processGeneration(env, item.id)))
+      await Promise.all(fresh.map(item => processGeneration(env, item.id)))
+    }
+    for (const item of stale) {
+      await processGeneration(env, item.id).catch(error => console.error('stale_generation_failed', item.id, error))
     }
     await run(env, 'DELETE FROM login_rate_limits WHERE window_started_at < ?', Date.now() - 24 * 60 * 60 * 1000)
     const lastFalSync = await first(env, "SELECT synced_at FROM provider_balances WHERE workspace_id = ? AND provider = 'fal.ai'", WORKSPACE_ID)
@@ -1528,6 +1572,7 @@ export const __test = {
   providerOutputText,
   providerKey,
   providerTimeoutMs,
+  maxQueuedMs,
   resultUrl,
   streamTextDelta,
   textRequestBody,

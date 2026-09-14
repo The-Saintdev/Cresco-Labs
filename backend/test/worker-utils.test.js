@@ -112,3 +112,11 @@ test('worker turns provider timeouts into a readable code and keeps the raw text
   assert.equal(__test.isTimeoutError(other), false)
   assert.equal(__test.providerFailure(other, 120000).message, 'byteplus_request_failed_404')
 })
+
+test('worker caps how long a generation may stay queued', () => {
+  assert.equal(__test.maxQueuedMs({}, 'text'), 600000)
+  assert.equal(__test.maxQueuedMs({}, 'image'), 1200000)
+  assert.equal(__test.maxQueuedMs({}, 'video'), 3600000)
+  assert.equal(__test.maxQueuedMs({ CRESCO_MAX_QUEUED_MINUTES: '5' }, 'video'), 300000)
+  assert.equal(__test.maxQueuedMs({}, 'unknown-kind'), 1800000)
+})

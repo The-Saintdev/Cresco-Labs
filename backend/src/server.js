@@ -204,9 +204,11 @@ function safeModel(model) {
 
 function safeGeneration(generation) {
   const { result: _, providerStatusUrl: __, providerResponseUrl: ___, lastProviderError: ____, ...safe } = generation
+  const queuedForMs = generation.status === 'queued' ? Date.now() - Date.parse(generation.createdAt) : null
   return {
     ...safe,
     outputText: providerOutputText(generation.result),
+    queuedForMs: Number.isFinite(queuedForMs) ? queuedForMs : null,
     references: (generation.referenceIds || []).map(id => db.uploads.find(item => item.id === id)).filter(Boolean).map(safeUpload),
   }
 }
@@ -833,12 +835,43 @@ function providerOutputText(data) {
   return null
 }
 
+const DEFAULT_MAX_QUEUED_MINUTES = { text: 10, image: 20, video: 60 }
+// A job nothing can advance is failed with a reason rather than left showing
+// "Processing" forever.
+function maxQueuedMs(kind) {
+  const override = positiveInt(process.env.CRESCO_MAX_QUEUED_MINUTES, 0)
+  return (override || DEFAULT_MAX_QUEUED_MINUTES[kind] || 30) * 60000
+}
+
+async function expireStaleGenerations() {
+  let changed = false
+  for (const generation of db.generations.filter(item => item.status === 'queued')) {
+    const age = Date.now() - Date.parse(generation.createdAt)
+    const ceiling = maxQueuedMs(generation.kind)
+    if (!Number.isFinite(age) || age <= ceiling) continue
+    generation.status = 'failed'
+    generation.providerState = 'expired'
+    generation.error = `generation_expired_after_${Math.round(ceiling / 60000)}m`
+    generation.completedAt = new Date().toISOString()
+    changed = true
+  }
+  if (changed) await persist()
+}
+
 async function reconcilePendingGenerations() {
+  await expireStaleGenerations()
   const pending = db.generations.filter(item => item.status === 'queued' && item.providerStatusUrl && item.providerResponseUrl).slice(0, 20)
   for (const generation of pending) {
     const model = db.models.find(item => item.id === generation.modelId)
     const credential = model && credentialFor(model.provider)
-    if (!model || !credential) continue
+    if (!model || !credential) {
+      generation.status = 'failed'
+      generation.providerState = 'unrecoverable'
+      generation.error = model ? 'provider_credential_removed' : 'model_removed'
+      generation.completedAt = new Date().toISOString()
+      await persist()
+      continue
+    }
     try {
       if (providerKey(model.provider) === 'byteplus') {
         const result = await bytePlusRequest(generation.providerStatusUrl, credential)
