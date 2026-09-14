@@ -1,0 +1,24 @@
+{
+  "name": "cresco-labs-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --dir frontend dev",
+    "build": "pnpm --dir frontend build",
+    "preview": "pnpm --dir frontend preview",
+    "api": "pnpm --dir backend start",
+    "api:dev": "pnpm --dir backend dev",
+    "api:cloudflare": "pnpm --dir backend cf:dev",
+    "api:deploy": "pnpm --dir backend cf:deploy",
+    "api:test": "pnpm --dir backend test",
+    "team:mobile": "pnpm --dir team-app start",
+    "admin:mobile": "pnpm --dir admin-app start",
+    "typecheck:mobile": "pnpm --dir team-app typecheck && pnpm --dir admin-app typecheck",
+    "check": "pnpm build && pnpm typecheck:mobile && pnpm api:test"
+  }
+}

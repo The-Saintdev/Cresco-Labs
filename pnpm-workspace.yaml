@@ -1,0 +1,12 @@
+packages:
+  - "frontend"
+  - "backend"
+  - "team-app"
+  - "admin-app"
+  - "mobile-shared"
+allowBuilds:
+  esbuild: true
+  workerd: true
+minimumReleaseAgeExclude:
+  - miniflare@5.20260911.0-alpha
+  - wrangler@4.131.1

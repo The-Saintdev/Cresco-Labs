@@ -1,0 +1,6 @@
+CRESCO_TOKEN_SECRET=replace-with-at-least-32-random-characters
+CRESCO_ENCRYPTION_KEY=replace-with-a-different-32-character-secret
+CRESCO_PASSWORD_PEPPER=replace-with-a-third-independent-random-secret
+CRESCO_ADMIN_EMAIL=admin@example.com
+CRESCO_ADMIN_PASSWORD=replace-with-a-strong-bootstrap-password
+CRESCO_ASSET_SIGNING_SECRET=replace-with-a-fourth-independent-random-secret

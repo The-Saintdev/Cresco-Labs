@@ -1,0 +1,12 @@
+{
+  "name": "@cresco/mobile-shared",
+  "version": "0.1.0",
+  "private": true,
+  "exports": {
+    "./api": "./api.ts",
+    "./tokens": "./tokens.ts"
+  },
+  "dependencies": {
+    "expo-secure-store": "~56.0.4"
+  }
+}

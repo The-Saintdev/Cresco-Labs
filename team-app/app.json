@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Cresco Labs",
+    "slug": "cresco-team",
+    "scheme": "cresco",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "icon": "./assets/icon.png",
+    "ios": {
+      "bundleIdentifier": "com.crescolabs.team",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "com.crescolabs.team",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#EEF2ED"
+      }
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
+  }
+}

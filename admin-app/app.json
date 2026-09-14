@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Cresco Admin",
+    "slug": "cresco-admin",
+    "scheme": "cresco-admin",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "icon": "./assets/icon.png",
+    "ios": {
+      "bundleIdentifier": "com.crescolabs.admin",
+      "supportsTablet": false
+    },
+    "android": {
+      "package": "com.crescolabs.admin",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/icon.png",
+        "backgroundColor": "#101313"
+      }
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
+  }
+}

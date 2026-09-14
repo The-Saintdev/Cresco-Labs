@@ -1,0 +1,25 @@
+{
+  "name": "@cresco/team-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "ios": "expo start --ios",
+    "android": "expo start --android",
+    "typecheck": "pnpm --dir ../frontend exec tsc --noEmit -p ../team-app/tsconfig.json"
+  },
+  "dependencies": {
+    "@cresco/mobile-shared": "workspace:*",
+    "expo": "~56.0.0",
+    "expo-document-picker": "~56.0.4",
+    "expo-secure-store": "~56.0.4",
+    "lucide-react-native": "1.44.0",
+    "react": "19.2.3",
+    "react-native": "0.85.0",
+    "react-native-svg": "15.15.5"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
+  }
+}
