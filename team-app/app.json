@@ -3,6 +3,10 @@
     "name": "Cresco Labs",
     "slug": "cresco-team",
     "scheme": "cresco",
+    "platforms": [
+      "ios",
+      "android"
+    ],
     "version": "0.1.0",
     "runtimeVersion": {
       "policy": "nativeVersion"

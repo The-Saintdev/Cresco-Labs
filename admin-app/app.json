@@ -3,6 +3,10 @@
     "name": "Cresco Admin",
     "slug": "cresco-admin",
     "scheme": "cresco-admin",
+    "platforms": [
+      "ios",
+      "android"
+    ],
     "version": "0.1.0",
     "runtimeVersion": {
       "policy": "nativeVersion"
