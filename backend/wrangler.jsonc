@@ -22,23 +22,6 @@
       "preview_bucket_name": "cresco-uploads-preview"
     }
   ],
-  "queues": {
-    "producers": [
-      {
-        "binding": "GENERATION_QUEUE",
-        "queue": "cresco-generations"
-      }
-    ],
-    "consumers": [
-      {
-        "queue": "cresco-generations",
-        "max_batch_size": 5,
-        "max_batch_timeout": 5,
-        "max_retries": 5,
-        "dead_letter_queue": "cresco-generations-dlq"
-      }
-    ]
-  },
   "triggers": {
     "crons": ["*/5 * * * *"]
   },

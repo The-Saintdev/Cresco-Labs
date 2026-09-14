@@ -95,3 +95,25 @@ time curl -sS -X POST "$CRESCO_BYTEPLUS_BASE_URL/chat/completions" \
   -d '{"model":"<endpoint-id>","messages":[{"role":"user","content":"hi"}],
        "thinking":{"type":"disabled"},"max_tokens":64}'
 ```
+
+## How async jobs advance (Cloudflare free plan)
+
+Cloudflare Queues requires the paid Workers plan, so the Worker does not use it and
+`wrangler.jsonc` declares no queue. A declared queue *consumer* makes `wrangler deploy`
+fail outright on the free plan, which is worth checking first if a deploy has been
+silently failing.
+
+Text is synchronous and needs none of this. Image and video on fal.ai are submitted,
+then polled. Three things advance a polled job, in order of how quickly a member sees it:
+
+1. **The reader's own request.** `GET /v1/generations/:id` and `GET /v1/history` poll the
+   provider for any queued generation they return, at most once every two seconds per
+   generation and at most three per history read. This is what makes a result appear
+   within seconds of the provider finishing.
+2. **The five-minute cron.** The safety net for jobs whose page nobody has open. It
+   processes directly anything untouched for two minutes.
+3. **The per-kind ceiling.** A generation queued past its limit is failed as
+   `generation_expired_after_Nm` rather than left running forever.
+
+`GENERATION_QUEUE` is still honoured if a binding is ever added, so moving to the paid
+plan needs only the config back — no code change.

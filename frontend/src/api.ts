@@ -190,10 +190,12 @@ export async function streamGeneration(
   options: Record<string, string> = {},
   referenceIds: string[] = [],
   handlers: GenerationStreamHandlers = {},
+  signal?: AbortSignal,
 ): Promise<ApiGeneration> {
   const token = sessionStorage.getItem('cresco_token')
   const response = await fetch(API_URL + '/v1/generations', {
     method: 'POST',
+    signal,
     headers: {
       'content-type': 'application/json',
       accept: 'text/event-stream',

@@ -166,6 +166,20 @@ function maxQueuedMs(env, kind) {
 // long is processed directly, so a missing or broken queue consumer cannot strand it.
 const STALE_QUEUED_MS = 120000
 
+// Cloudflare Queues is a paid-plan feature, so on the free plan the only things
+// that can advance an async job are the five-minute cron and the reader's own
+// poll. Five minutes is far too slow to watch a result arrive, so reads advance
+// the job themselves, no faster than this interval per generation.
+const MIN_ADVANCE_MS = 2000
+const MAX_ADVANCE_PER_READ = 3
+
+function readyToAdvance(generation) {
+  if (generation.status !== 'queued') return false
+  const marker = generation.lastProviderAttemptAt || generation.dispatchedAt || generation.createdAt
+  const parsed = Date.parse(marker)
+  return !Number.isFinite(parsed) || Date.now() - parsed >= MIN_ADVANCE_MS
+}
+
 function requestPath(url) {
   try {
     return new URL(url).pathname
@@ -531,7 +545,18 @@ async function historyPage(env, user, url) {
   bindings.push(limit + 1)
   const rows = await all(env, `SELECT * FROM generations WHERE ${clauses.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ?`, ...bindings)
   const hasMore = rows.length > limit
-  const page = rows.slice(0, limit).map(generationFromRow)
+  let page = rows.slice(0, limit).map(generationFromRow)
+  // Without a queue, a member watching this list is what moves their jobs along.
+  // Bounded so one read can never fan out into an unbounded set of provider calls.
+  const advancing = page.filter(readyToAdvance).slice(0, MAX_ADVANCE_PER_READ)
+  if (advancing.length) {
+    await Promise.all(advancing.map(item =>
+      processGeneration(env, item.id).catch(error => console.error('advance_failed', item.id, error))))
+    const refreshed = await all(env, `SELECT * FROM generations WHERE workspace_id = ? AND id IN (${advancing.map(() => '?').join(',')})`,
+      WORKSPACE_ID, ...advancing.map(item => item.id))
+    const byId = new Map(refreshed.map(row => [row.id, generationFromRow(row)]))
+    page = page.map(item => byId.get(item.id) || item)
+  }
   await attachReferences(env, page)
   return { generations: page.map(safeGeneration), nextCursor: hasMore ? page.at(-1)?.id || null : null }
 }
@@ -1240,8 +1265,13 @@ async function route(request, env, ctx) {
 
   const generationMatch = path.match(/^\/v1\/generations\/([^/]+)$/)
   if (generationMatch && request.method === 'GET') {
-    const generation = generationFromRow(await first(env, 'SELECT * FROM generations WHERE id = ? AND workspace_id = ?', decodeURIComponent(generationMatch[1]), WORKSPACE_ID))
+    const generationId = decodeURIComponent(generationMatch[1])
+    let generation = generationFromRow(await first(env, 'SELECT * FROM generations WHERE id = ? AND workspace_id = ?', generationId, WORKSPACE_ID))
     if (!generation || (user.role !== 'admin' && generation.userId !== user.id)) throw new ApiError(404, 'generation_not_found')
+    if (readyToAdvance(generation)) {
+      await processGeneration(env, generationId).catch(error => console.error('advance_failed', generationId, error))
+      generation = generationFromRow(await first(env, 'SELECT * FROM generations WHERE id = ? AND workspace_id = ?', generationId, WORKSPACE_ID)) || generation
+    }
     await attachReferences(env, [generation])
     return json({ generation: safeGeneration(generation) }, 200, origin)
   }
