@@ -19,6 +19,7 @@ frontend/       Member web app and Vercel configuration
 admin-app/      Private Expo admin app and EAS profiles
 team-app/       Member Expo app and EAS profiles
 mobile-shared/  Shared mobile API client and design tokens only
+                (UI primitives stay in each app so this package needs no React Native dependency)
 docs/           Architecture, accounting and deployment instructions
 ```
 
@@ -28,15 +29,18 @@ All clients are login-only. Members cannot register themselves. The workspace ad
 
 ## Brand system
 
-The interface uses an iOS-inspired liquid-glass language with translucent surfaces, restrained blur, soft highlights, and a consistent palette:
+The interface is neutral, high contrast and dense. Surfaces are flat, separated by
+single-pixel borders rather than shadows, with small radii and a tight vertical
+rhythm. Colour carries meaning and is never decoration: one accent for actions, a
+state palette for success, warning and failure, and one hue per model kind.
 
-- Ink `#101313`
-- Mist `#EEF2ED`
-- Sage `#B9D78E`
-- Coral `#E99A7A`
-- Lilac `#B7A7D5`
-- Blue `#7DA8BD`
-- Sand `#DDBA69`
+Light, dark and system themes are all first-class. The web app stores the choice
+per browser; each mobile app stores it per device. Web tokens live in
+`frontend/src/styles.css`, and the shared mobile palette in
+`mobile-shared/tokens.ts`.
+
+- Accent `#4D7C2A` light / `#A5D178` dark
+- Text `#4A7F96`, image `#7D6AA8`, video `#C06A45`
 
 The primary web logo is stored at `frontend/public/brand/cresco-mark.png`. Mobile app icon copies live in each app's `assets` directory.
 

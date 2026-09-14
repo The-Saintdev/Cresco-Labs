@@ -1,4 +1,4 @@
-import { ActivityIndicator, StyleSheet, Text, TouchableOpacity, View, type StyleProp, type ViewStyle } from 'react-native'
+import { ActivityIndicator, StyleSheet, Text, TextInput, TouchableOpacity, View, type StyleProp, type ViewStyle } from 'react-native'
 import { FileText, Film, Image as ImageIcon, type LucideIcon } from 'lucide-react-native'
 import { kindColor, radius, space, type Theme } from '@cresco/mobile-shared/tokens'
 import { useThemeChoice } from './theme'
@@ -88,3 +88,67 @@ export const sheet = StyleSheet.create({
   rowBetween: { flexDirection: 'row', alignItems: 'center', gap: space.md },
   grow: { flex: 1, minWidth: 0 },
 })
+
+export function Row({ children, onPress }: { children: React.ReactNode; onPress?: () => void }) {
+  const theme = useTheme()
+  const content = <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.md, padding: space.lg }}>{children}</View>
+  if (!onPress) return <Card style={{ marginBottom: space.sm }}>{content}</Card>
+  return <TouchableOpacity activeOpacity={0.8} onPress={onPress}><Card style={{ marginBottom: space.sm, borderColor: theme.border }}>{content}</Card></TouchableOpacity>
+}
+
+export function Field({
+  label, value, onChange, placeholder, secure, hint, keyboard,
+}: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+  placeholder?: string
+  secure?: boolean
+  hint?: string
+  keyboard?: 'default' | 'email-address' | 'decimal-pad'
+}) {
+  const theme = useTheme()
+  return <View style={{ gap: 6 }}>
+    <Text style={{ fontSize: 12, fontWeight: '500', color: theme.textMuted }}>{label}</Text>
+    <TextInput
+      value={value}
+      onChangeText={onChange}
+      placeholder={placeholder}
+      placeholderTextColor={theme.textFaint}
+      secureTextEntry={secure}
+      autoCapitalize={keyboard === 'email-address' ? 'none' : 'sentences'}
+      keyboardType={keyboard === 'decimal-pad' ? 'decimal-pad' : keyboard === 'email-address' ? 'email-address' : 'default'}
+      style={{
+        minHeight: 46, color: theme.text, backgroundColor: theme.bgRaised,
+        borderWidth: 1, borderColor: theme.border, borderRadius: radius.md,
+        paddingHorizontal: space.md, fontSize: 15,
+      }}
+    />
+    {hint ? <Text style={{ fontSize: 12, color: theme.textFaint }}>{hint}</Text> : null}
+  </View>
+}
+
+export function Choice<T extends string>({ value, options, onChange }: { value: T; options: readonly { value: T; label: string }[]; onChange: (value: T) => void }) {
+  const theme = useTheme()
+  return <View style={{ flexDirection: 'row', padding: 3, gap: 3, borderRadius: radius.md, backgroundColor: theme.bgSunken }}>
+    {options.map(option => (
+      <TouchableOpacity
+        key={option.value}
+        accessibilityRole="tab"
+        accessibilityState={{ selected: value === option.value }}
+        onPress={() => onChange(option.value)}
+        style={{ flex: 1, minHeight: 38, alignItems: 'center', justifyContent: 'center', borderRadius: radius.sm, backgroundColor: value === option.value ? theme.bgRaised : 'transparent' }}
+      >
+        <Text style={{ fontSize: 12.5, fontWeight: value === option.value ? '600' : '400', color: value === option.value ? theme.text : theme.textMuted }}>{option.label}</Text>
+      </TouchableOpacity>
+    ))}
+  </View>
+}
+
+export function SectionTitle({ title, detail }: { title: string; detail?: string }) {
+  const theme = useTheme()
+  return <View style={{ marginTop: space.lg, marginBottom: space.md }}>
+    <Text style={{ fontSize: 16, fontWeight: '600', color: theme.text }}>{title}</Text>
+    {detail ? <Text style={{ fontSize: 12.5, color: theme.textFaint, marginTop: 3, lineHeight: 18 }}>{detail}</Text> : null}
+  </View>
+}

@@ -7,20 +7,26 @@ import {
   ActivityIndicator, Image, KeyboardAvoidingView, Platform, RefreshControl, SafeAreaView,
   ScrollView, StatusBar, Text, TextInput, TouchableOpacity, View,
 } from 'react-native'
-import { ArrowDownToLine, ChevronLeft, Clock3, Gauge, LayoutGrid, Paperclip, Send, Settings as SettingsIcon, X } from 'lucide-react-native'
+import { ArrowDownToLine, ChevronLeft, Gauge, LayoutGrid, MessageSquare, Paperclip, Plus, Send, Settings as SettingsIcon, Trash2, X } from 'lucide-react-native'
 import { elapsed, kindColor, money, radius, relativeTime, space, type Theme } from '@cresco/mobile-shared/tokens'
 import {
-  clearMobileSession, getGeneration, getMemberWorkspace, login as apiLogin, restoreMobileSession,
-  submitGeneration, uploadMobileReference,
-  type ApiGeneration, type ApiModel, type ApiUpload, type UsageSummary,
+  archiveSession, clearMobileSession, getGeneration, getMemberWorkspace, getSession, listSessions,
+  login as apiLogin, restoreMobileSession, submitGeneration, uploadMobileReference,
+  type ApiGeneration, type ApiModel, type ApiSession, type ApiUpload, type UsageSummary,
 } from '@cresco/mobile-shared/api'
 import { Button, Card, Empty, ErrorNote, KindBadge, StatusPill, sheet, useTheme, type Kind } from './ui'
+import { ThemeProvider, useThemeChoice, type ThemeChoice } from './theme'
 
-type Tab = 'models' | 'history' | 'usage' | 'settings'
+type Tab = 'models' | 'chats' | 'usage' | 'settings'
+type OpenThread = { model: ApiModel; sessionId?: string }
 
 const emptyUsage: UsageSummary = { spendNanoUsd: 0, calls: 0, byModel: [], balances: [] }
 
 export default function App() {
+  return <ThemeProvider><Workspace /></ThemeProvider>
+}
+
+function Workspace() {
   const theme = useTheme()
   const [restoring, setRestoring] = useState(true)
   const [signedIn, setSignedIn] = useState(false)
@@ -29,14 +35,16 @@ export default function App() {
   const [models, setModels] = useState<ApiModel[]>([])
   const [history, setHistory] = useState<ApiGeneration[]>([])
   const [usage, setUsage] = useState<UsageSummary>(emptyUsage)
-  const [openModel, setOpenModel] = useState<ApiModel | null>(null)
+  const [sessions, setSessions] = useState<ApiSession[]>([])
+  const [open, setOpen] = useState<OpenThread | null>(null)
   const [refreshing, setRefreshing] = useState(false)
 
   const refresh = useCallback(async () => {
-    const data = await getMemberWorkspace()
+    const [data, threads] = await Promise.all([getMemberWorkspace(), listSessions().catch(() => ({ sessions: [] }))])
     setModels(data.models)
     setHistory(data.generations)
     setUsage(data.usage)
+    setSessions(threads.sessions)
   }, [])
 
   const pull = useCallback(async () => {
@@ -84,17 +92,19 @@ export default function App() {
     }} />
   }
 
-  if (openModel) {
-    return <ModelScreen
-      model={openModel}
-      history={history}
-      onBack={() => setOpenModel(null)}
+  if (open) {
+    return <ThreadScreen
+      key={open.sessionId || `new-${open.model.id}`}
+      model={open.model}
+      sessionId={open.sessionId}
+      onBack={() => setOpen(null)}
+      onNew={() => setOpen({ model: open.model })}
       onCreated={generation => setHistory(items => [generation, ...items.filter(item => item.id !== generation.id)])}
       onRefresh={refresh}
     />
   }
 
-  const titles: Record<Tab, string> = { models: 'Models', history: 'History', usage: 'Usage', settings: 'Settings' }
+  const titles: Record<Tab, string> = { models: 'Models', chats: 'Chats', usage: 'Usage', settings: 'Settings' }
 
   return <SafeAreaView style={[sheet.screen, { backgroundColor: theme.bg }]}>
     <StatusBar barStyle={theme.bg === '#ffffff' ? 'dark-content' : 'light-content'} />
@@ -107,14 +117,20 @@ export default function App() {
       contentContainerStyle={sheet.scroll}
       refreshControl={<RefreshControl refreshing={refreshing} onRefresh={pull} tintColor={theme.textMuted} />}
     >
-      {tab === 'models' && <ModelList models={models} onOpen={setOpenModel} theme={theme} />}
-      {tab === 'history' && <HistoryList history={history} theme={theme} />}
+      {tab === 'models' && <ModelList models={models} onOpen={model => setOpen({ model })} theme={theme} />}
+      {tab === 'chats' && <ChatList
+        sessions={sessions}
+        models={models}
+        theme={theme}
+        onOpen={(model, sessionId) => setOpen({ model, sessionId })}
+        onArchive={id => { setSessions(items => items.filter(item => item.id !== id)); void archiveSession(id).catch(() => undefined) }}
+      />}
       {tab === 'usage' && <UsageView usage={usage} theme={theme} />}
       {tab === 'settings' && <SettingsView name={name} theme={theme} onSignOut={() => { void clearMobileSession(); setSignedIn(false); setTab('models') }} />}
     </ScrollView>
 
     <View style={{ flexDirection: 'row', borderTopWidth: 1, borderTopColor: theme.border, backgroundColor: theme.bgSubtle, paddingBottom: space.sm }}>
-      {([['models', LayoutGrid], ['history', Clock3], ['usage', Gauge], ['settings', SettingsIcon]] as const).map(([value, Icon]) => (
+      {([['models', LayoutGrid], ['chats', MessageSquare], ['usage', Gauge], ['settings', SettingsIcon]] as const).map(([value, Icon]) => (
         <TouchableOpacity
           key={value}
           accessibilityRole="tab"
@@ -151,33 +167,31 @@ function ModelList({ models, onOpen, theme }: { models: ApiModel[]; onOpen: (mod
   </View>
 }
 
-function HistoryList({ history, theme }: { history: ApiGeneration[]; theme: Theme }) {
-  const [openId, setOpenId] = useState<string | null>(null)
-  if (!history.length) return <Empty title="Nothing yet" text="Your generations appear here once you run a model." />
+function ChatList({ sessions, models, theme, onOpen, onArchive }: {
+  sessions: ApiSession[]
+  models: ApiModel[]
+  theme: Theme
+  onOpen: (model: ApiModel, sessionId: string) => void
+  onArchive: (id: string) => void
+}) {
+  if (!sessions.length) return <Empty title="No chats yet" text="Start one from the Models tab. Each chat keeps its own history." />
   return <View style={{ gap: space.sm }}>
-    {history.map(item => {
-      const open = openId === item.id
-      return <Card key={item.id} style={{ padding: space.lg }}>
-        <TouchableOpacity activeOpacity={0.8} onPress={() => setOpenId(value => (value === item.id ? null : item.id))} style={{ flexDirection: 'row', alignItems: 'center', gap: space.md }}>
-          <KindBadge kind={item.kind as Kind} size={30} />
+    {sessions.map(item => {
+      const model = models.find(entry => entry.id === item.modelId)
+      if (!model) return null
+      return <Card key={item.id} style={{ padding: space.lg, flexDirection: 'row', alignItems: 'center', gap: space.md }}>
+        <TouchableOpacity activeOpacity={0.8} onPress={() => onOpen(model, item.id)} style={{ flexDirection: 'row', alignItems: 'center', gap: space.md, flex: 1 }}>
+          <KindBadge kind={model.kind as Kind} size={30} />
           <View style={sheet.grow}>
             <Text numberOfLines={1} style={{ fontSize: 14, fontWeight: '600', color: theme.text }}>{item.title}</Text>
             <Text numberOfLines={1} style={{ fontSize: 12, color: theme.textFaint, marginTop: 2 }}>
-              {item.modelName || item.modelId} · {money(item.costNanoUsd)} · {relativeTime(item.createdAt)}
+              {model.name} · {item.generationCount || 0} {item.generationCount === 1 ? 'run' : 'runs'} · {relativeTime(item.updatedAt)}
             </Text>
           </View>
-          <StatusPill status={item.status} />
         </TouchableOpacity>
-        {item.status === 'queued' && <Text style={{ fontSize: 12, color: theme.textFaint, marginTop: space.sm }}>
-          Waiting{item.queuedForMs ? ` ${elapsed(item.queuedForMs)}` : ''} for {item.modelProvider || 'the provider'}.
-        </Text>}
-        {open && <View style={{ marginTop: space.md, gap: space.sm }}>
-          <Text style={{ fontSize: 12, color: theme.textFaint }}>Prompt</Text>
-          <Text style={{ fontSize: 14, color: theme.text, lineHeight: 21 }}>{item.prompt}</Text>
-          {item.error ? <ErrorNote>{item.error}</ErrorNote> : null}
-          {item.outputText ? <><Text style={{ fontSize: 12, color: theme.textFaint }}>Response</Text><Text selectable style={{ fontSize: 15, color: theme.text, lineHeight: 23 }}>{item.outputText}</Text></> : null}
-          {item.resultUrl ? <ResultMedia generation={item} theme={theme} /> : null}
-        </View>}
+        <TouchableOpacity accessibilityLabel={`Remove ${item.title}`} onPress={() => onArchive(item.id)} style={{ padding: space.sm }}>
+          <Trash2 size={15} color={theme.textFaint} />
+        </TouchableOpacity>
       </Card>
     })}
   </View>
@@ -214,31 +228,54 @@ function UsageView({ usage, theme }: { usage: UsageSummary; theme: Theme }) {
 }
 
 function SettingsView({ name, theme, onSignOut }: { name: string; theme: Theme; onSignOut: () => void }) {
+  const { choice, setChoice } = useThemeChoice()
   return <View style={{ gap: space.sm }}>
     <Card style={{ padding: space.lg }}>
       <Text style={{ fontSize: 12, color: theme.textFaint }}>Signed in as</Text>
       <Text style={{ fontSize: 16, fontWeight: '600', color: theme.text, marginTop: 4 }}>{name}</Text>
     </Card>
+
+    <Card style={{ padding: space.lg }}>
+      <Text style={{ fontSize: 14, fontWeight: '600', color: theme.text }}>Appearance</Text>
+      <Text style={{ fontSize: 12, color: theme.textFaint, marginTop: 2, marginBottom: space.md }}>Applies to this device.</Text>
+      <View style={{ flexDirection: 'row', padding: 3, gap: 3, borderRadius: radius.md, backgroundColor: theme.bgSunken }}>
+        {(['system', 'light', 'dark'] as const).map(value => (
+          <TouchableOpacity
+            key={value}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: choice === value }}
+            onPress={() => setChoice(value as ThemeChoice)}
+            style={{ flex: 1, minHeight: 36, alignItems: 'center', justifyContent: 'center', borderRadius: radius.sm, backgroundColor: choice === value ? theme.bgRaised : 'transparent' }}
+          >
+            <Text style={{ fontSize: 13, fontWeight: choice === value ? '600' : '400', color: choice === value ? theme.text : theme.textMuted, textTransform: 'capitalize' }}>{value}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+    </Card>
+
     <Card style={{ padding: space.lg }}>
       <Text style={{ fontSize: 13, color: theme.textMuted, lineHeight: 20 }}>
-        Appearance follows your device's light or dark setting. Account details and model access are managed by your workspace administrator.
+        Account details and model access are managed by your workspace administrator.
       </Text>
     </Card>
+
     <Button label="Sign out" tone="danger" onPress={onSignOut} style={{ marginTop: space.sm }} />
   </View>
 }
 
-function ModelScreen({
-  model, history, onBack, onCreated, onRefresh,
+function ThreadScreen({
+  model, sessionId, onBack, onNew, onCreated, onRefresh,
 }: {
   model: ApiModel
-  history: ApiGeneration[]
+  sessionId?: string
   onBack: () => void
+  onNew: () => void
   onCreated: (generation: ApiGeneration) => void
   onRefresh: () => Promise<void>
 }) {
   const theme = useTheme()
   const kind = model.kind as Kind
+  const [turns, setTurns] = useState<ApiGeneration[]>([])
   const [prompt, setPrompt] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
@@ -246,28 +283,38 @@ function ModelScreen({
   const [duration, setDuration] = useState('10 seconds')
   const [references, setReferences] = useState<ApiUpload[]>([])
   const [uploading, setUploading] = useState(false)
-  const [active, setActive] = useState<ApiGeneration | null>(null)
-
-  const mine = useMemo(() => history.filter(item => item.modelId === model.id).slice(0, 20), [history, model.id])
+  const [thread, setThread] = useState<string | undefined>(sessionId)
 
   useEffect(() => {
-    if (!active || active.status !== 'queued') return
+    if (!sessionId) return
     let alive = true
-    let timer: ReturnType<typeof setTimeout>
-    const poll = async () => {
-      try {
-        const next = (await getGeneration(active.id)).generation
-        if (!alive) return
-        setActive(next)
-        onCreated(next)
-        if (next.status === 'queued') timer = setTimeout(poll, 2500)
-      } catch {
-        if (alive) timer = setTimeout(poll, 4000)
+    void getSession(sessionId)
+      .then(data => { if (alive) setTurns(data.generations) })
+      .catch(() => { if (alive) setError('This chat could not be loaded.') })
+    return () => { alive = false }
+  }, [sessionId])
+
+  // Reading a generation advances it server-side, so polling both refreshes the
+  // view and moves queued work along.
+  const waiting = turns.some(item => item.status === 'queued')
+  useEffect(() => {
+    if (!waiting) return
+    let alive = true
+    const timer = setInterval(async () => {
+      const queued = turns.filter(item => item.status === 'queued').slice(0, 3)
+      for (const item of queued) {
+        try {
+          const next = (await getGeneration(item.id)).generation
+          if (!alive) return
+          setTurns(items => items.map(entry => (entry.id === next.id ? next : entry)))
+          onCreated(next)
+        } catch {
+          /* a failed poll simply retries on the next tick */
+        }
       }
-    }
-    timer = setTimeout(poll, 1500)
-    return () => { alive = false; clearTimeout(timer) }
-  }, [active?.id, active?.status, onCreated])
+    }, 2500)
+    return () => { alive = false; clearInterval(timer) }
+  }, [waiting, turns, onCreated])
 
   const attach = async () => {
     setError('')
@@ -290,14 +337,37 @@ function ModelScreen({
     }
   }
 
+  // Feeding a finished result back in is how an existing image or video is edited.
+  const reuse = async (generation: ApiGeneration) => {
+    if (!generation.resultUrl) return
+    setError(''); setUploading(true)
+    try {
+      const extension = generation.kind === 'video' ? 'mp4' : 'png'
+      const target = `${FileSystem.cacheDirectory}reuse-${generation.id}.${extension}`
+      const downloaded = await FileSystem.downloadAsync(generation.resultUrl, target)
+      const uploaded = await uploadMobileReference({
+        uri: downloaded.uri,
+        name: `cresco-${generation.id}.${extension}`,
+        mimeType: generation.kind === 'video' ? 'video/mp4' : 'image/png',
+      })
+      setReferences(items => [...items.filter(item => item.id !== uploaded.upload.id), uploaded.upload].slice(0, 5))
+      setPrompt(current => current || 'Edit this: ')
+    } catch {
+      setError('That result could not be reused. Download it and attach it manually.')
+    } finally {
+      setUploading(false)
+    }
+  }
+
   const generate = async () => {
     if (!prompt.trim() || busy) return
     setBusy(true); setError('')
     try {
       const options: Record<string, string> = kind === 'text' ? {} : kind === 'video' ? { aspect, duration } : { aspect }
-      const created = (await submitGeneration(model.id, prompt.trim(), options, references.map(item => item.id))).generation
+      const created = (await submitGeneration(model.id, prompt.trim(), options, references.map(item => item.id), thread)).generation
+      setTurns(items => [...items, created])
       onCreated(created)
-      setActive(created)
+      if (!thread && created.sessionId) setThread(created.sessionId)
       setPrompt(''); setReferences([])
       void onRefresh().catch(() => undefined)
     } catch (reason) {
@@ -306,8 +376,6 @@ function ModelScreen({
       setBusy(false)
     }
   }
-
-  const shown = active ? [active, ...mine.filter(item => item.id !== active.id)] : mine
 
   return <SafeAreaView style={[sheet.screen, { backgroundColor: theme.bg }]}>
     <View style={{ flexDirection: 'row', alignItems: 'center', gap: space.sm, paddingHorizontal: space.sm, paddingVertical: space.sm, borderBottomWidth: 1, borderBottomColor: theme.border }}>
@@ -318,13 +386,16 @@ function ModelScreen({
         <Text style={{ fontSize: 15, fontWeight: '600', color: theme.text }}>{model.name}</Text>
         <Text style={{ fontSize: 12, color: theme.textFaint }}>{model.provider}</Text>
       </View>
-      <KindBadge kind={kind} size={30} />
+      <TouchableOpacity accessibilityRole="button" accessibilityLabel="New chat" onPress={onNew} style={{ flexDirection: 'row', alignItems: 'center', gap: 5, minHeight: 36, paddingHorizontal: space.md, borderRadius: radius.md, borderWidth: 1, borderColor: theme.border }}>
+        <Plus size={14} color={theme.textMuted} />
+        <Text style={{ fontSize: 13, fontWeight: '500', color: theme.textMuted }}>New</Text>
+      </TouchableOpacity>
     </View>
 
     <KeyboardAvoidingView style={sheet.screen} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={8}>
       <ScrollView contentContainerStyle={sheet.scroll}>
-        {shown.length ? <View style={{ gap: space.md }}>
-          {shown.map(item => <Card key={item.id} style={{ padding: space.lg, gap: space.sm }}>
+        {turns.length ? <View style={{ gap: space.md }}>
+          {turns.map(item => <Card key={item.id} style={{ padding: space.lg, gap: space.sm }}>
             <View style={sheet.rowBetween}>
               <Text style={{ fontSize: 12, color: theme.textFaint, flex: 1 }}>{relativeTime(item.createdAt)}</Text>
               {item.providerLatencyMs ? <Text style={{ fontSize: 12, color: theme.textFaint }}>{elapsed(item.providerLatencyMs)}</Text> : null}
@@ -337,7 +408,7 @@ function ModelScreen({
             </View>}
             {item.error ? <ErrorNote>{item.error}</ErrorNote> : null}
             {item.outputText ? <Text selectable style={{ fontSize: 15, color: theme.text, lineHeight: 23 }}>{item.outputText}</Text> : null}
-            {item.resultUrl ? <ResultMedia generation={item} theme={theme} /> : null}
+            {item.resultUrl ? <ResultMedia generation={item} theme={theme} onReuse={() => void reuse(item)} /> : null}
           </Card>)}
         </View> : <Empty title={`Start with ${model.name}`} text={kind === 'text' ? 'Write a prompt below and the response appears here.' : 'Describe what you want and the result appears here.'} />}
       </ScrollView>
@@ -400,7 +471,7 @@ function Chip({ label, onPress, theme }: { label: string; onPress: () => void; t
   </TouchableOpacity>
 }
 
-function ResultMedia({ generation, theme }: { generation: ApiGeneration; theme: Theme }) {
+function ResultMedia({ generation, theme, onReuse }: { generation: ApiGeneration; theme: Theme; onReuse?: () => void }) {
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const save = async () => {
@@ -424,7 +495,10 @@ function ResultMedia({ generation, theme }: { generation: ApiGeneration; theme: 
       ? <Image source={{ uri: generation.resultUrl! }} resizeMode="contain" style={{ width: '100%', height: 280, borderRadius: radius.md, backgroundColor: theme.bgSunken }} />
       : <ResultVideo url={generation.resultUrl!} background={theme.bgSunken} />}
     {saveError ? <ErrorNote>{saveError}</ErrorNote> : null}
-    <Button label={saving ? 'Preparing…' : 'Save'} tone="secondary" icon={ArrowDownToLine} busy={saving} onPress={save} />
+    <View style={{ flexDirection: 'row', gap: space.sm }}>
+      <Button label={saving ? 'Preparing…' : 'Save'} tone="secondary" icon={ArrowDownToLine} busy={saving} onPress={save} style={{ flex: 1 }} />
+      {onReuse && <Button label="Use as reference" tone="secondary" onPress={onReuse} style={{ flex: 1 }} />}
+    </View>
   </View>
 }
 
