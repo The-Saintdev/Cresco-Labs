@@ -153,7 +153,7 @@ test('login, authorization, and usage summary', async () => {
       body: JSON.stringify({ modelId: bytePlusTextModel.model.id, prompt: 'Test direct BytePlus text output.' }),
     })
     const bytePlusText = await bytePlusTextResponse.json()
-    assert.equal(bytePlusTextResponse.status, 202)
+    assert.equal(bytePlusTextResponse.status, 201)
     assert.equal(bytePlusText.generation.status, 'complete')
     assert.equal(bytePlusText.generation.outputText, 'BytePlus text response')
     assert.equal(bytePlusText.generation.modelProvider, 'BytePlus')

@@ -4,6 +4,8 @@ packages:
   - "team-app"
   - "admin-app"
   - "mobile-shared"
+overrides:
+  react-dom: 19.2.3
 allowBuilds:
   esbuild: true
   workerd: true

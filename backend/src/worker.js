@@ -1018,11 +1018,16 @@ async function route(request, env, ctx) {
       if (message.includes('workspace_budget_exceeded')) throw new ApiError(402, 'workspace_budget_exceeded')
       throw error
     }
-    await audit(env, user, 'generation.queued', id, { modelId: model.id })
+    await audit(env, user, 'generation.submitted', id, { modelId: model.id })
     const generation = { id, userId: user.id, userEmail: user.email, title, modelId: model.id, modelName: model.name, modelProvider: model.provider, kind: model.kind, prompt, options, status: 'queued', costNanoUsd: 0, createdAt, references: [] }
     if (referenceIds.length) await attachReferences(env, [generation])
-    ctx.waitUntil(enqueueGeneration(env, id).then(queued => queued ? undefined : processGeneration(env, id)))
-    return json({ generation: safeGeneration(generation) }, 202, origin)
+    const processing = await processGeneration(env, id)
+    if (!processing.done) {
+      ctx.waitUntil(enqueueGeneration(env, id, processing.retrySeconds || 20))
+    }
+    const current = generationFromRow(await first(env, 'SELECT * FROM generations WHERE id = ? AND workspace_id = ?', id, WORKSPACE_ID))
+    await attachReferences(env, [current])
+    return json({ generation: safeGeneration(current) }, current.status === 'complete' ? 201 : 202, origin)
   }
 
   if (user.role !== 'admin') throw new ApiError(403, 'admin_required')

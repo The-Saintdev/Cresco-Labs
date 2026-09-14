@@ -167,7 +167,7 @@ export async function getWorkspaceData() {
   return { models: models.models, generations: history.generations, usage }
 }
 
-export async function queueGeneration(modelId: string, prompt: string, options: Record<string, string> = {}, referenceIds: string[] = []) {
+export async function submitGeneration(modelId: string, prompt: string, options: Record<string, string> = {}, referenceIds: string[] = []) {
   return request<{ generation: ApiGeneration }>('/v1/generations', {
     method: 'POST',
     body: JSON.stringify({ modelId, prompt, options, referenceIds }),

@@ -1,8 +1,9 @@
 import * as SecureStore from 'expo-secure-store'
 
 declare const process: { env: Record<string, string | undefined> }
+declare const __DEV__: boolean
 
-const API_URL = process.env.EXPO_PUBLIC_API_URL || 'http://10.0.2.2:8787'
+const API_URL = process.env.EXPO_PUBLIC_API_URL || (__DEV__ ? 'http://10.0.2.2:8787' : 'https://cresco-api.thesaintray5522.workers.dev')
 const SESSION_KEY = 'cresco_mobile_session'
 let sessionToken = ''
 
@@ -96,7 +97,7 @@ export async function getMemberWorkspace() {
   return { models: models.models, generations: history.generations, usage }
 }
 
-export async function queueGeneration(modelId: string, prompt: string, options: Record<string, string> = {}, referenceIds: string[] = []) {
+export async function submitGeneration(modelId: string, prompt: string, options: Record<string, string> = {}, referenceIds: string[] = []) {
   return request<{ generation: ApiGeneration }>('/v1/generations', { method: 'POST', body: JSON.stringify({ modelId, prompt, options, referenceIds }) })
 }
 

@@ -1,11 +1,11 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  ArrowUpRight, Bell, Bot, Check, ChevronDown, CircleHelp, Clock3, Eye, EyeOff,
+  ArrowUpRight, Bell, Bot, Check, ChevronDown, CircleHelp, Clock3, Download, Eye, EyeOff,
   Film, Gauge, Image as ImageIcon, LayoutGrid, LockKeyhole, Menu, MessageSquare,
   MoreHorizontal, Plus, Search, Settings, ShieldCheck, SlidersHorizontal,
   Sparkles, Upload, Users, WandSparkles, X,
 } from 'lucide-react'
-import { clearSession, getWorkspaceData, login as apiLogin, queueGeneration, restoreSession, updateMe, uploadReference, type ApiBalance, type ApiUpload, type SessionUser, type UsageSummary } from './api'
+import { clearSession, getGeneration, getWorkspaceData, login as apiLogin, restoreSession, submitGeneration, updateMe, uploadReference, type ApiBalance, type ApiGeneration, type ApiUpload, type SessionUser, type UsageSummary } from './api'
 
 type View = 'home' | 'history' | 'usage' | 'settings'
 type ModelKind = 'Text' | 'Image' | 'Video'
@@ -31,7 +31,7 @@ type Activity = {
   kind: ModelKind
   color: ModelColor
   cost: string
-  status: 'Complete' | 'Failed' | 'Queued'
+  status: 'Complete' | 'Failed' | 'Processing'
   prompt: string
   resultUrl?: string | null
   outputText?: string | null
@@ -56,6 +56,23 @@ const navItems = [
 const cx = (...values: Array<string | false | undefined>) => values.filter(Boolean).join(' ')
 const money = (value: number) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(value)
 const initials = (name: string) => name.split(' ').map(part => part[0]).join('').slice(0, 2).toUpperCase()
+const downloadResult = async (url: string, id: string, kind: ModelKind) => {
+  const extension = new URL(url).pathname.split('.').pop()?.replace(/[^a-z0-9]/gi, '').slice(0, 5) || (kind === 'Video' ? 'mp4' : 'png')
+  try {
+    const response = await fetch(url)
+    if (!response.ok) throw new Error('download_failed')
+    const objectUrl = URL.createObjectURL(await response.blob())
+    const anchor = document.createElement('a')
+    anchor.href = objectUrl
+    anchor.download = `cresco-${id}.${extension}`
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    URL.revokeObjectURL(objectUrl)
+  } catch {
+    window.open(url, '_blank', 'noopener,noreferrer')
+  }
+}
 
 export default function App() {
   const [user, setUser] = useState<SessionUser | null>(() => restoreSession())
@@ -105,7 +122,7 @@ export default function App() {
           kind,
           color: model?.color || 'sage',
           cost: money(Number(item.costNanoUsd || 0) / 1_000_000_000),
-          status: item.status === 'failed' ? 'Failed' : item.status === 'queued' ? 'Queued' : 'Complete',
+          status: item.status === 'failed' ? 'Failed' : item.status === 'queued' ? 'Processing' : 'Complete',
           prompt: item.prompt,
           resultUrl: item.resultUrl,
           outputText: item.outputText,
@@ -127,12 +144,12 @@ export default function App() {
     void refreshWorkspace()
   }, [user, refreshWorkspace])
 
-  const hasQueuedWork = activity.some(item => item.status === 'Queued')
+  const hasProcessingWork = activity.some(item => item.status === 'Processing')
   useEffect(() => {
-    if (!user || !hasQueuedWork) return
+    if (!user || !hasProcessingWork) return
     const timer = window.setInterval(() => void refreshWorkspace(true), 5000)
     return () => window.clearInterval(timer)
-  }, [user, hasQueuedWork, refreshWorkspace])
+  }, [user, hasProcessingWork, refreshWorkspace])
 
   const navigate = (next: View) => {
     setView(next)
@@ -157,7 +174,7 @@ export default function App() {
         {view === 'settings' && <SettingsView user={user} onUserUpdated={setUser} onSaved={notify} onLogout={() => { clearSession(); setUser(null) }} />}
       </div>
     </main>
-    {activeModel && <ModelWorkspace model={activeModel} onClose={() => setActiveModel(null)} onQueued={item => { setActivity(items => [item, ...items]); notify('Generation added to your queue') }} />}
+    {activeModel && <ModelWorkspace model={activeModel} onClose={() => setActiveModel(null)} onSubmitted={item => { setActivity(items => [item, ...items]); notify('Request sent to the provider') }} />}
     {searchOpen && <CommandSearch models={models} onClose={() => setSearchOpen(false)} onModel={model => { setSearchOpen(false); setActiveModel(model) }} onHistory={() => { setSearchOpen(false); navigate('history') }} />}
     {toast && <div className="toast"><Check size={15}/>{toast}</div>}
   </div>
@@ -302,7 +319,9 @@ function DetailDrawer({ item, onClose }: { item: Activity; onClose: () => void }
     <div className="detail-grid"><div><span>Model</span><strong>{item.model}</strong></div><div><span>Status</span><strong>{item.status}</strong></div><div><span>Cost</span><strong>{item.cost}</strong></div><div><span>Created</span><strong>{item.date}</strong></div></div>
     <label className="detail-label">Prompt</label><div className="prompt-copy">{item.prompt}</div>
     {item.outputText && <><label className="detail-label">Response</label><div className="prompt-copy">{item.outputText}</div></>}
-    {item.resultUrl ? <a className="secondary-button" href={item.resultUrl} target="_blank" rel="noreferrer"><ArrowUpRight size={15}/> Open result</a> : !item.outputText ? <button className="secondary-button" disabled><Clock3 size={15}/> Result pending</button> : null}
+    {item.resultUrl && item.kind === 'Image' && <img className="inline-result-media history-result-media" src={item.resultUrl} alt={`${item.title} result`}/>}
+    {item.resultUrl && item.kind === 'Video' && <video className="inline-result-media history-result-media" src={item.resultUrl} controls playsInline/>}
+    {item.resultUrl ? <div className="inline-result-actions"><button className="inline-result-link primary-download" onClick={() => void downloadResult(item.resultUrl!, item.id, item.kind)}><Download size={15}/> Download</button><a className="inline-result-link" href={item.resultUrl} target="_blank" rel="noreferrer"><ArrowUpRight size={15}/> Open original</a></div> : !item.outputText ? <button className="secondary-button" disabled><Clock3 size={15}/> Result processing</button> : null}
   </aside></div>
 }
 
@@ -424,9 +443,9 @@ function Toggle({ label, detail, checked, onChange }: { label: string; detail: s
   return <div className="toggle-row"><div><strong>{label}</strong><span>{detail}</span></div><button className={cx('toggle', checked && 'on')} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}><i/></button></div>
 }
 
-function ModelWorkspace({ model, onClose, onQueued }: { model: Model; onClose: () => void; onQueued: (item: Activity) => void }) {
+function ModelWorkspace({ model, onClose, onSubmitted }: { model: Model; onClose: () => void; onSubmitted: (item: Activity) => void }) {
   const [prompt, setPrompt] = useState('')
-  const [result, setResult] = useState(false)
+  const [generation, setGeneration] = useState<ApiGeneration | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [aspect, setAspect] = useState(model.kind === 'Image' ? '1:1' : '16:9')
@@ -437,6 +456,23 @@ function ModelWorkspace({ model, onClose, onQueued }: { model: Model; onClose: (
   const [references, setReferences] = useState<ApiUpload[]>([])
   const [uploading, setUploading] = useState(false)
   const Icon = model.icon
+  useEffect(() => {
+    if (!generation || generation.status !== 'queued') return
+    let active = true
+    let timer = 0
+    const poll = async () => {
+      try {
+        const next = (await getGeneration(generation.id)).generation
+        if (!active) return
+        setGeneration(next)
+        if (next.status === 'queued') timer = window.setTimeout(poll, 2000)
+      } catch (reason) {
+        if (active) setError(reason instanceof Error ? reason.message : 'Could not refresh the provider response.')
+      }
+    }
+    timer = window.setTimeout(poll, 1200)
+    return () => { active = false; window.clearTimeout(timer) }
+  }, [generation?.id, generation?.status])
   const addReferences = async (files: FileList | null) => {
     if (!files?.length) return
     const available = Math.max(0, 5 - references.length)
@@ -454,11 +490,11 @@ function ModelWorkspace({ model, onClose, onQueued }: { model: Model; onClose: (
     setBusy(true); setError('')
     try {
       const options: Record<string, string> = model.kind === 'Video' ? { aspect, quality, duration } : model.kind === 'Image' ? { aspect, quality } : { depth, length }
-      const { generation } = await queueGeneration(model.id, prompt.trim(), options, references.map(item => item.id))
-      setResult(true)
-      onQueued({ id: generation.id, title: generation.title, model: model.name, date: 'Just now', kind: model.kind, color: model.color, cost: '$0.00', status: 'Queued', prompt: generation.prompt, createdAt: generation.createdAt })
+      const response = (await submitGeneration(model.id, prompt.trim(), options, references.map(item => item.id))).generation
+      setGeneration(response)
+      onSubmitted({ id: response.id, title: response.title, model: model.name, date: 'Just now', kind: model.kind, color: model.color, cost: money(Number(response.costNanoUsd || 0) / 1_000_000_000), status: response.status === 'complete' ? 'Complete' : response.status === 'failed' ? 'Failed' : 'Processing', prompt: response.prompt, resultUrl: response.resultUrl, outputText: response.outputText, createdAt: response.createdAt })
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'Could not queue this generation.')
+      setError(reason instanceof Error ? reason.message : 'Could not send this request.')
     } finally { setBusy(false) }
   }
   return <div className="modal-backdrop" onClick={onClose}><section className="modal workspace-modal" onClick={event => event.stopPropagation()}>
@@ -473,11 +509,13 @@ function ModelWorkspace({ model, onClose, onQueued }: { model: Model; onClose: (
       <Select value={quality} onChange={setQuality} options={model.kind === 'Video' ? ['480p', '720p', '1080p'] : ['Standard', 'High']}/>
     </div>}
     {model.kind === 'Text' && <div className="workspace-options"><Select value={depth} onChange={setDepth} options={['Fast', 'Balanced', 'Deep']}/><Select value={length} onChange={setLength} options={['Short', 'Auto length', 'Long']}/></div>}
-    <textarea value={prompt} onChange={event => { setPrompt(event.target.value); setResult(false) }} placeholder={model.kind === 'Video' ? 'Describe the scene, action, camera and mood…' : model.kind === 'Image' ? 'Describe the composition, subject, light and style…' : 'Ask anything or describe what you want to make…'}/>
+    <textarea value={prompt} onChange={event => { setPrompt(event.target.value); setGeneration(null) }} placeholder={model.kind === 'Video' ? 'Describe the scene, action, camera and mood…' : model.kind === 'Image' ? 'Describe the composition, subject, light and style…' : 'Ask anything or describe what you want to make…'}/>
     {model.kind !== 'Text' && <><label className={cx('upload-hint', uploading && 'uploading')}><Upload size={15}/> {uploading ? 'Uploading reference…' : `Add reference ${model.kind === 'Video' ? 'images, video or audio' : 'image'}`} <span>{references.length}/5</span><input type="file" multiple accept={model.kind === 'Video' ? 'image/*,video/*,audio/*' : 'image/*'} disabled={uploading || references.length >= 5} onChange={event => { void addReferences(event.target.files); event.target.value = '' }} hidden/></label>{references.length > 0 && <div className="reference-list">{references.map(reference => <div className="reference-chip" key={reference.id}><div><strong>{reference.fileName}</strong><span>{(reference.size / 1024 / 1024).toFixed(reference.size > 1024 * 1024 ? 1 : 2)} MB</span></div><button onClick={() => setReferences(items => items.filter(item => item.id !== reference.id))} aria-label={`Remove ${reference.fileName}`}><X size={13}/></button></div>)}</div>}</>}
     {error && <div className="login-error">{error}</div>}
-    {result && <div className="result-preview"><Sparkles size={17}/><div><strong>Generation queued</strong><span>The request and prompt are now recorded in your workspace history.</span></div></div>}
-    <div className="workspace-footer"><span>Estimated cost · <strong>{model.estimate}</strong></span><button className="primary-button" disabled={!prompt.trim()||busy||uploading} onClick={generate}><Sparkles size={15}/> {busy?'Queuing…':'Generate'}</button></div>
+    {generation?.status === 'queued' && <div className="result-preview processing"><span className="result-spinner"/><div><strong>Provider is processing</strong><span>Your request was sent immediately. This page will update as soon as the result is ready.</span></div></div>}
+    {generation?.status === 'failed' && <div className="result-preview failed"><X size={17}/><div><strong>Request failed</strong><span>{generation.error || 'The provider could not complete this request.'}</span></div></div>}
+    {generation?.status === 'complete' && <div className="inline-result"><div className="inline-result-head"><Sparkles size={19}/><div><strong>Result ready</strong><span>Returned by {model.provider}</span></div></div>{generation.outputText && <div className="inline-result-text">{generation.outputText}</div>}{generation.resultUrl && model.kind === 'Image' && <img className="inline-result-media" src={generation.resultUrl} alt={`${model.name} result`}/>} {generation.resultUrl && model.kind === 'Video' && <video className="inline-result-media" src={generation.resultUrl} controls playsInline/>}{generation.resultUrl && <div className="inline-result-actions"><button className="inline-result-link primary-download" onClick={() => void downloadResult(generation.resultUrl!, generation.id, model.kind)}><Download size={15}/> Download</button><a className="inline-result-link" href={generation.resultUrl} target="_blank" rel="noreferrer"><ArrowUpRight size={15}/> Open original</a></div>}</div>}
+    <div className="workspace-footer"><span>Estimated cost · <strong>{model.estimate}</strong></span><button className="primary-button" disabled={!prompt.trim()||busy||uploading} onClick={generate}><Sparkles size={15}/> {busy?'Sending…':generation?.status==='queued'?'Send another':'Generate'}</button></div>
   </section></div>
 }
 

@@ -4,8 +4,14 @@
     "slug": "cresco-admin",
     "scheme": "cresco-admin",
     "version": "0.1.0",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/592e8c85-3a9b-425e-97af-6b39c810d913"
+    },
     "orientation": "portrait",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "icon": "./assets/icon.png",
     "ios": {
       "bundleIdentifier": "com.crescolabs.admin",
@@ -18,8 +24,24 @@
         "backgroundColor": "#101313"
       }
     },
+    "androidStatusBar": {
+      "backgroundColor": "#07090A",
+      "barStyle": "light-content"
+    },
+    "androidNavigationBar": {
+      "backgroundColor": "#07090A",
+      "barStyle": "light-content"
+    },
     "plugins": [
-      "expo-secure-store"
-    ]
+      "expo-secure-store",
+      "expo-video",
+      "expo-sharing"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "592e8c85-3a9b-425e-97af-6b39c810d913"
+      }
+    },
+    "owner": "thesaint_dev"
   }
 }

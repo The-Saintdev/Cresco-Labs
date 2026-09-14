@@ -7,16 +7,22 @@
     "development": {
       "distribution": "internal",
       "environment": "development",
+      "channel": "development",
+      "env": { "EXPO_PUBLIC_API_URL": "https://cresco-api.thesaintray5522.workers.dev" },
       "android": { "buildType": "apk" }
     },
     "preview": {
       "distribution": "internal",
       "environment": "preview",
+      "channel": "preview",
+      "env": { "EXPO_PUBLIC_API_URL": "https://cresco-api.thesaintray5522.workers.dev" },
       "android": { "buildType": "apk" }
     },
     "production": {
       "autoIncrement": true,
-      "environment": "production"
+      "environment": "production",
+      "channel": "production",
+      "env": { "EXPO_PUBLIC_API_URL": "https://cresco-api.thesaintray5522.workers.dev" }
     }
   },
   "submit": {

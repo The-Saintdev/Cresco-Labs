@@ -6,7 +6,7 @@
     "./api": "./api.ts",
     "./tokens": "./tokens.ts"
   },
-  "dependencies": {
+  "peerDependencies": {
     "expo-secure-store": "~56.0.4"
   }
 }

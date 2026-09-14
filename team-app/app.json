@@ -4,6 +4,12 @@
     "slug": "cresco-team",
     "scheme": "cresco",
     "version": "0.1.0",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/6a6b1dda-f013-4a52-a88d-993abf0267ba"
+    },
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "icon": "./assets/icon.png",
@@ -19,7 +25,15 @@
       }
     },
     "plugins": [
-      "expo-secure-store"
-    ]
+      "expo-secure-store",
+      "expo-video",
+      "expo-sharing"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "6a6b1dda-f013-4a52-a88d-993abf0267ba"
+      }
+    },
+    "owner": "thesaint_dev"
   }
 }

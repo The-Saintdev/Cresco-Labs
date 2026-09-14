@@ -767,9 +767,9 @@ const server = createServer(async (request, response) => {
         createdAt: new Date().toISOString(),
       }
       db.generations.unshift(created)
-      await audit(user, 'generation.queued', created.id, { modelId: model.id })
+      await audit(user, 'generation.submitted', created.id, { modelId: model.id })
       await dispatchGeneration(created, model, user)
-      return send(response, 202, { generation: safeGeneration(created) }, origin)
+      return send(response, created.status === 'complete' ? 201 : 202, { generation: safeGeneration(created) }, origin)
     }
 
     if (user.role !== 'admin') return send(response, 403, { error: 'admin_required' }, origin)
