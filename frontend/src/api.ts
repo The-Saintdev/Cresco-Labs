@@ -252,12 +252,27 @@ export async function streamGeneration(
     throw new Error(generationErrorMessage(String(data.error || 'generation_failed')))
   }
 
+  // A backend that predates streaming answers the same request with a JSON
+  // generation record. Treat that as a single, non-streamed turn.
+  if (!(response.headers.get('content-type') || '').includes('text/event-stream')) {
+    const data = await response.json().catch(() => ({}))
+    if (data?.generation) {
+      handlers.onMeta?.(data.generation, data.session || null)
+      if (data.generation.outputText) handlers.onDelta?.(data.generation.outputText)
+      return data.generation
+    }
+    throw new Error(generationErrorMessage(String(data?.error || 'generation_failed')))
+  }
+
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
   let event = ''
-  let final: ApiGeneration | null = null
-  let failure = ''
+  // Held on an object rather than in locals: these are written from the frame
+  // callback, and TypeScript cannot follow assignments made inside a closure.
+  const seen: { started: ApiGeneration | null; final: ApiGeneration | null; failure: string } = {
+    started: null, final: null, failure: '',
+  }
 
   const handleFrame = (name: string, payload: string) => {
     if (!payload) return
@@ -267,10 +282,13 @@ export async function streamGeneration(
     } catch {
       return
     }
-    if (name === 'meta' && data.generation) handlers.onMeta?.(data.generation, data.session || null)
+    if (name === 'meta' && data.generation) {
+      seen.started = data.generation
+      handlers.onMeta?.(data.generation, data.session || null)
+    }
     else if (name === 'delta' && typeof data.text === 'string') handlers.onDelta?.(data.text)
-    else if (name === 'done' && data.generation) final = data.generation
-    else if (name === 'error') failure = String(data.error || 'generation_failed')
+    else if (name === 'done' && data.generation) seen.final = data.generation
+    else if (name === 'error') seen.failure = String(data.error || 'generation_failed')
   }
 
   for (;;) {
@@ -288,9 +306,22 @@ export async function streamGeneration(
     }
   }
 
-  if (failure) throw new Error(generationErrorMessage(failure))
-  if (!final) throw new Error('The model connection closed before it finished responding.')
-  return final
+  if (seen.failure) throw new Error(generationErrorMessage(seen.failure))
+  if (seen.final) return seen.final
+
+  // The stream ended without a final frame: the connection dropped, or the
+  // worker was cut short mid-response. The generation may still have finished
+  // server-side, so ask for it directly before giving up.
+  const pending = seen.started
+  if (pending) {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 600 * (attempt + 1)))
+      const current = await getGeneration(pending.id).then(data => data.generation).catch(() => null)
+      if (current?.status === 'complete') return current
+      if (current?.status === 'failed') throw new Error(generationErrorMessage(current.error || 'generation_failed'))
+    }
+  }
+  throw new Error('The connection to the model dropped before it finished. Check History — the response may have completed anyway.')
 }
 
 export function generationErrorMessage(code: string): string {
