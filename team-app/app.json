@@ -5,7 +5,7 @@
     "scheme": "cresco",
     "version": "0.1.0",
     "runtimeVersion": {
-      "policy": "appVersion"
+      "policy": "nativeVersion"
     },
     "updates": {
       "url": "https://u.expo.dev/6a6b1dda-f013-4a52-a88d-993abf0267ba"
