@@ -63,3 +63,35 @@ A model is executable only when it is published, has an endpoint, has an encrypt
 The backend checks the configured per-generation and monthly workspace limits before dispatch. Queued requests reserve their catalog estimate; completed requests use their recorded cost. A zero limit means no hard cap.
 
 The local JSON and upload adapters are development-only. The free hosted schema is in `db/d1`; the optional PostgreSQL contract in `db/001_initial.sql` is retained only for a future migration.
+
+## Text model latency
+
+Text generations are dispatched synchronously against the provider; only video tasks use the queue. Two model settings and three environment variables control how long that call may take.
+
+Per-model, set from the admin app when the model kind is Text:
+
+- `thinkingMode` — `disabled` (default), `enabled`, or `auto`. A reasoning pass is the usual reason a flash-class model exceeds its request timeout, and it is billed. `auto` sends no field and leaves the decision to the provider.
+- `textApi` — `chat_completions` (default) or `responses`. Both are supported so the two endpoints can be compared for latency on the same model without a redeploy.
+
+Per environment:
+
+- `CRESCO_PROVIDER_TIMEOUT_MS` — non-text dispatch and all status polls. Default `20000`.
+- `CRESCO_TEXT_TIMEOUT_MS` — non-streaming text dispatch. Default `120000`.
+- `CRESCO_TEXT_STREAM_TIMEOUT_MS` — total lifetime of a streamed text response. Default `300000`.
+
+`POST /v1/generations` with `"stream": true` on a text model returns `text/event-stream` with `meta`, `delta`, `done` and `error` events instead of a JSON record. The generation row is finalised before the stream closes, so a reload shows the same result. Members see output at first token rather than after the full completion.
+
+## Diagnosing a provider failure
+
+Every provider call logs one structured line — `{"event":"provider_call","provider":…,"kind":…,"path":…,"status":…,"durationMs":…}` — with no prompt, result or credential in it. Read it with `wrangler tail` or the local API's stdout.
+
+Each generation also records `providerLatencyMs`. A failed generation keeps two separate fields: `error` is a stable code shown to members (for example `provider_timeout_after_120s`), while `lastProviderError` holds the raw provider or runtime text and is never returned to a client — read it from D1 when a code alone is not enough.
+
+To isolate whether a slow text model is the provider or Cresco, call the provider directly with the same endpoint ID and compare:
+
+```bash
+time curl -sS -X POST "$CRESCO_BYTEPLUS_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $ARK_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"<endpoint-id>","messages":[{"role":"user","content":"hi"}],
+       "thinking":{"type":"disabled"},"max_tokens":64}'
+```

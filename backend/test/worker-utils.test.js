@@ -57,3 +57,58 @@ test('worker extracts safe text output from provider responses', () => {
   assert.equal(__test.providerOutputText({ output: [{ content: [{ type: 'output_text', text: 'Nested response' }] }] }), 'Nested response')
   assert.equal(__test.providerOutputText({}), null)
 })
+
+test('worker reads chat completion output', () => {
+  assert.equal(__test.providerOutputText({ choices: [{ message: { role: 'assistant', content: 'Chat response' } }] }), 'Chat response')
+  assert.equal(__test.providerOutputText({ choices: [{ message: { content: [{ text: 'Part one. ' }, { text: 'Part two.' }] } }] }), 'Part one. Part two.')
+  assert.equal(__test.providerOutputText({ choices: [{ message: { content: '' } }] }), null)
+})
+
+test('worker gives text generations a longer timeout than polls', () => {
+  assert.equal(__test.providerTimeoutMs({}, 'text'), 120000)
+  assert.equal(__test.providerTimeoutMs({}, 'text', true), 300000)
+  assert.equal(__test.providerTimeoutMs({}, 'video'), 20000)
+  assert.equal(__test.providerTimeoutMs({}, 'poll'), 20000)
+  assert.equal(__test.providerTimeoutMs({ CRESCO_TEXT_TIMEOUT_MS: '45000' }, 'text'), 45000)
+  assert.equal(__test.providerTimeoutMs({ CRESCO_TEXT_TIMEOUT_MS: 'nonsense' }, 'text'), 120000)
+})
+
+test('worker builds chat completion bodies with reasoning disabled by default', () => {
+  const model = { endpoint: 'glm-5.3-flash' }
+  assert.equal(__test.textRequestPath(model), '/chat/completions')
+  const body = __test.textRequestBody(model, 'Say hello')
+  assert.deepEqual(body.messages, [{ role: 'user', content: 'Say hello' }])
+  assert.deepEqual(body.thinking, { type: 'disabled' })
+  assert.equal(body.stream, undefined)
+  const streamed = __test.textRequestBody(model, 'Say hello', { stream: true })
+  assert.equal(streamed.stream, true)
+  assert.deepEqual(streamed.stream_options, { include_usage: true })
+})
+
+test('worker honours per-model reasoning and endpoint settings', () => {
+  const responsesModel = { endpoint: 'glm-5.3-flash', textApi: 'responses', thinkingMode: 'enabled' }
+  assert.equal(__test.textRequestPath(responsesModel), '/responses')
+  const body = __test.textRequestBody(responsesModel, 'Say hello')
+  assert.equal(body.input, 'Say hello')
+  assert.deepEqual(body.thinking, { type: 'enabled' })
+  assert.equal(__test.textRequestBody({ endpoint: 'x', thinkingMode: 'auto' }, 'hi').thinking, undefined)
+})
+
+test('worker reads streamed deltas from both text APIs', () => {
+  assert.equal(__test.streamTextDelta({ choices: [{ delta: { content: 'Hel' } }] }), 'Hel')
+  assert.equal(__test.streamTextDelta({ choices: [{ delta: { content: [{ text: 'lo' }] } }] }), 'lo')
+  assert.equal(__test.streamTextDelta({ type: 'response.output_text.delta', delta: '!' }), '!')
+  assert.equal(__test.streamTextDelta({ choices: [{ delta: { reasoning_content: 'thinking' } }] }), '')
+})
+
+test('worker turns provider timeouts into a readable code and keeps the raw text', () => {
+  const aborted = new Error('The operation was aborted due to timeout')
+  aborted.name = 'TimeoutError'
+  assert.equal(__test.isTimeoutError(aborted), true)
+  const mapped = __test.providerFailure(aborted, 120000)
+  assert.equal(mapped.message, 'provider_timeout_after_120s')
+  assert.equal(mapped.providerDetail, 'The operation was aborted due to timeout')
+  const other = new Error('byteplus_request_failed_404')
+  assert.equal(__test.isTimeoutError(other), false)
+  assert.equal(__test.providerFailure(other, 120000).message, 'byteplus_request_failed_404')
+})

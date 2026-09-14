@@ -72,6 +72,8 @@ function AddModel({models,providers,refresh,onError}:{models:ApiModel[];provider
   const [description,setDescription]=useState('')
   const [provider,setProvider]=useState('')
   const [endpoint,setEndpoint]=useState('')
+  const [thinkingMode,setThinkingMode]=useState<'disabled'|'enabled'|'auto'>('disabled')
+  const [textApi,setTextApi]=useState<'chat_completions'|'responses'>('chat_completions')
   const [price,setPrice]=useState('')
   const [apiKey,setApiKey]=useState('')
   const [busy,setBusy]=useState(false)
@@ -79,12 +81,12 @@ function AddModel({models,providers,refresh,onError}:{models:ApiModel[];provider
   const normalizeProvider=(value:string)=>{const key=value.trim().toLowerCase();if(key.includes('fal.ai')||key==='fal')return 'fal.ai';if(key.includes('openai'))return 'openai';if(key.includes('anthropic'))return 'anthropic';if(key.includes('google'))return 'google';return key}
   const providerAlreadySecured=providers.some(item=>normalizeProvider(item.provider)===normalizeProvider(provider))
   const ready=Boolean(name.trim()&&provider.trim()&&endpoint.trim()&&(editingId||apiKey.trim()||providerAlreadySecured)&&Number(price)>=0)
-  const clearForm=()=>{setEditingId('');setKind('Text');setName('');setDescription('');setProvider('');setEndpoint('');setPrice('');setApiKey('')}
-  const beginEdit=(model:ApiModel)=>{setEditingId(model.id);setKind(model.kind[0].toUpperCase()+model.kind.slice(1));setName(model.name);setDescription(model.description||'');setProvider(model.provider);setEndpoint(model.endpoint||'');setPrice(String(Number(model.priceNanoUsd||0)/1_000_000_000));setApiKey('')}
+  const clearForm=()=>{setEditingId('');setKind('Text');setName('');setDescription('');setProvider('');setEndpoint('');setPrice('');setThinkingMode('disabled');setTextApi('chat_completions');setApiKey('')}
+  const beginEdit=(model:ApiModel)=>{setEditingId(model.id);setKind(model.kind[0].toUpperCase()+model.kind.slice(1));setName(model.name);setDescription(model.description||'');setProvider(model.provider);setEndpoint(model.endpoint||'');setPrice(String(Number(model.priceNanoUsd||0)/1_000_000_000));setThinkingMode(model.thinkingMode||'disabled');setTextApi(model.textApi||'chat_completions');setApiKey('')}
   const add=async()=>{
     if(!ready)return
     setBusy(true);onError('')
-    try{const input={name:name.trim(),description:description.trim(),provider:provider.trim(),endpoint:endpoint.trim(),apiKey:apiKey.trim()||undefined,priceUsd:Number(price),kind:kind.toLowerCase() as ApiModel['kind']};if(editingId)await apiUpdateModel(editingId,input);else await apiCreateModel({...input,status:'active'});await refresh();clearForm()}
+    try{const input={name:name.trim(),description:description.trim(),provider:provider.trim(),endpoint:endpoint.trim(),apiKey:apiKey.trim()||undefined,priceUsd:Number(price),kind:kind.toLowerCase() as ApiModel['kind'],...(kind==='Text'?{thinkingMode,textApi}:{})};if(editingId)await apiUpdateModel(editingId,input);else await apiCreateModel({...input,status:'active'});await refresh();clearForm()}
     catch(reason){onError(reason instanceof Error?reason.message:'Could not save model.')}
     finally{setBusy(false)}
   }
@@ -105,6 +107,12 @@ function AddModel({models,providers,refresh,onError}:{models:ApiModel[];provider
     <Field label="DESCRIPTION" placeholder="What this model is best used for" value={description} onChange={setDescription}/>
     <Field label="PROVIDER" placeholder="e.g. fal.ai" value={provider} onChange={setProvider}/>
     <Field label="ENDPOINT ID" placeholder="provider/model/endpoint" value={endpoint} onChange={setEndpoint}/>
+    {kind==='Text'?<>
+      <Text style={s.sectionSub}>Reasoning adds latency and billed tokens. Leave it off unless this model needs it.</Text>
+      <View style={admin.typeRow}>{([['disabled','No reasoning'],['enabled','Reasoning on'],['auto','Provider default']] as const).map(([value,label])=><TouchableOpacity key={value} style={[admin.typeChoice,thinkingMode===value&&admin.typeSelected]} onPress={()=>setThinkingMode(value)}><Text style={admin.typeText}>{label}</Text></TouchableOpacity>)}</View>
+      <Text style={s.sectionSub}>Chat completions is the standard text endpoint. Switch only to compare latency.</Text>
+      <View style={admin.typeRow}>{([['chat_completions','Chat completions'],['responses','Responses API']] as const).map(([value,label])=><TouchableOpacity key={value} style={[admin.typeChoice,textApi===value&&admin.typeSelected]} onPress={()=>setTextApi(value)}><Text style={admin.typeText}>{label}</Text></TouchableOpacity>)}</View>
+    </>:null}
     <Field label="ESTIMATED COST PER RUN (USD)" placeholder="e.g. 0.62" value={price} onChange={setPrice}/>
     <Text style={s.label}>API KEY</Text>
     <View style={s.keyInput}><KeyRound size={18} color={colors.muted}/><TextInput style={s.keyText} value={apiKey} onChangeText={setApiKey} placeholder={providerAlreadySecured?'Using secured provider key':'Encrypted on the backend'} placeholderTextColor={colors.muted} selectionColor={colors.sage} secureTextEntry/></View>

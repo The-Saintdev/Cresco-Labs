@@ -136,6 +136,86 @@ function providerKey(provider) {
   return value
 }
 
+const DEFAULT_PROVIDER_TIMEOUT_MS = 20000
+const DEFAULT_TEXT_TIMEOUT_MS = 120000
+const DEFAULT_TEXT_STREAM_TIMEOUT_MS = 300000
+const THINKING_MODES = ['disabled', 'enabled', 'auto']
+const TEXT_APIS = ['chat_completions', 'responses']
+
+function positiveInt(value, fallback) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback
+}
+
+function providerTimeoutMs(env, kind, streaming = false) {
+  if (kind !== 'text') return positiveInt(env.CRESCO_PROVIDER_TIMEOUT_MS, DEFAULT_PROVIDER_TIMEOUT_MS)
+  if (streaming) return positiveInt(env.CRESCO_TEXT_STREAM_TIMEOUT_MS, DEFAULT_TEXT_STREAM_TIMEOUT_MS)
+  return positiveInt(env.CRESCO_TEXT_TIMEOUT_MS, DEFAULT_TEXT_TIMEOUT_MS)
+}
+
+function requestPath(url) {
+  try {
+    return new URL(url).pathname
+  } catch {
+    return 'unknown'
+  }
+}
+
+// Prompts, results and credentials are never logged: only routing and timing.
+function logProviderCall(details) {
+  console.log(JSON.stringify({ event: 'provider_call', ...details }))
+}
+
+function isTimeoutError(error) {
+  const name = String(error?.name || '')
+  return name === 'TimeoutError' || name === 'AbortError' || /aborted due to timeout/i.test(String(error?.message || ''))
+}
+
+// Members should never see a raw DOMException. The original text is kept on the
+// generation as last_provider_error so the cause stays diagnosable.
+function providerFailure(error, timeoutMs) {
+  const detail = error instanceof Error ? error.message : String(error)
+  const failure = isTimeoutError(error)
+    ? new Error(`provider_timeout_after_${Math.round(timeoutMs / 1000)}s`)
+    : new Error(detail || 'provider_request_failed')
+  failure.providerDetail = detail
+  return failure
+}
+
+function providerDetail(error) {
+  if (error?.providerDetail) return String(error.providerDetail)
+  return error instanceof Error ? error.message : 'provider_request_failed'
+}
+
+function thinkingMode(model) {
+  return THINKING_MODES.includes(model?.thinkingMode) ? model.thinkingMode : 'disabled'
+}
+
+function textApi(model) {
+  return TEXT_APIS.includes(model?.textApi) ? model.textApi : 'chat_completions'
+}
+
+function textRequestPath(model) {
+  return textApi(model) === 'responses' ? '/responses' : '/chat/completions'
+}
+
+// 'auto' leaves the decision to the provider default; anything else is explicit,
+// and 'disabled' is the default because a reasoning pass is the main reason a
+// flash-class model takes longer than the request timeout.
+function textRequestBody(model, prompt, { stream = false } = {}) {
+  const mode = thinkingMode(model)
+  const thinking = mode === 'auto' ? {} : { thinking: { type: mode } }
+  if (textApi(model) === 'responses') {
+    return { model: model.endpoint, input: prompt, ...thinking, ...(stream ? { stream: true } : {}) }
+  }
+  return {
+    model: model.endpoint,
+    messages: [{ role: 'user', content: prompt }],
+    ...thinking,
+    ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}),
+  }
+}
+
 function userFromRow(row) {
   if (!row) return null
   return {
@@ -167,6 +247,8 @@ function modelFromRow(row) {
     endpoint: row.endpoint,
     status: row.status,
     priceNanoUsd: Number(row.price_nano_usd || 0),
+    thinkingMode: THINKING_MODES.includes(row.thinking_mode) ? row.thinking_mode : 'disabled',
+    textApi: TEXT_APIS.includes(row.text_api) ? row.text_api : 'chat_completions',
     createdAt: row.created_at,
     archivedAt: row.archived_at,
   }
@@ -217,6 +299,7 @@ function generationFromRow(row) {
     lastProviderError: row.last_provider_error,
     lastProviderAttemptAt: row.last_provider_attempt_at,
     pollAttempts: Number(row.poll_attempts || 0),
+    providerLatencyMs: row.provider_latency_ms === null || row.provider_latency_ms === undefined ? null : Number(row.provider_latency_ms),
     createdAt: row.created_at,
     dispatchedAt: row.dispatched_at,
     completedAt: row.completed_at,
@@ -295,6 +378,12 @@ function providerOutputText(data) {
   if (typeof data.output_text === 'string') return data.output_text
   if (typeof data.output === 'string') return data.output
   if (typeof data.text === 'string') return data.text
+  const message = data?.choices?.[0]?.message
+  if (typeof message?.content === 'string' && message.content) return message.content
+  if (Array.isArray(message?.content)) {
+    const joined = message.content.map(part => (typeof part?.text === 'string' ? part.text : '')).join('')
+    if (joined) return joined
+  }
   for (const item of Array.isArray(data.output) ? data.output : []) {
     for (const content of Array.isArray(item?.content) ? item.content : []) {
       if (typeof content?.text === 'string') return content.text
@@ -546,12 +635,21 @@ async function falInput(generation, user, env) {
 }
 
 async function falRequest(url, credential, env, init = {}) {
-  const response = await fetch(url, {
-    ...init,
-    headers: { authorization: `Key ${await decryptSecret(credential.encrypted_api_key, env)}`, 'content-type': 'application/json', ...(init.headers || {}) },
-    signal: AbortSignal.timeout(20000),
-  })
+  const { timeoutMs = providerTimeoutMs(env), kind = null, ...rest } = init
+  const startedAt = Date.now()
+  let response
+  try {
+    response = await fetch(url, {
+      ...rest,
+      headers: { authorization: `Key ${await decryptSecret(credential.encrypted_api_key, env)}`, 'content-type': 'application/json', ...(rest.headers || {}) },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (error) {
+    logProviderCall({ provider: 'fal.ai', kind, path: requestPath(url), ok: false, durationMs: Date.now() - startedAt, timeoutMs, error: String(error?.name || 'FetchError') })
+    throw providerFailure(error, timeoutMs)
+  }
   const data = await response.json().catch(() => ({}))
+  logProviderCall({ provider: 'fal.ai', kind, path: requestPath(url), ok: response.ok, status: response.status, durationMs: Date.now() - startedAt })
   if (!response.ok) throw new Error(data.detail || data.message || `fal_request_failed_${response.status}`)
   return data
 }
@@ -668,12 +766,21 @@ function bytePlusBase(env) {
 }
 
 async function bytePlusRequest(url, credential, env, init = {}) {
-  const response = await fetch(url, {
-    ...init,
-    headers: { authorization: `Bearer ${await decryptSecret(credential.encrypted_api_key, env)}`, 'content-type': 'application/json', ...(init.headers || {}) },
-    signal: AbortSignal.timeout(20000),
-  })
+  const { timeoutMs = providerTimeoutMs(env), kind = null, ...rest } = init
+  const startedAt = Date.now()
+  let response
+  try {
+    response = await fetch(url, {
+      ...rest,
+      headers: { authorization: `Bearer ${await decryptSecret(credential.encrypted_api_key, env)}`, 'content-type': 'application/json', ...(rest.headers || {}) },
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (error) {
+    logProviderCall({ provider: 'byteplus', kind, path: requestPath(url), ok: false, durationMs: Date.now() - startedAt, timeoutMs, error: String(error?.name || 'FetchError') })
+    throw providerFailure(error, timeoutMs)
+  }
   const data = await response.json().catch(() => ({}))
+  logProviderCall({ provider: 'byteplus', kind, path: requestPath(url), ok: response.ok, status: response.status, durationMs: Date.now() - startedAt })
   if (!response.ok) throw new Error(data?.error?.message || data?.message || `byteplus_request_failed_${response.status}`)
   return data
 }
@@ -691,9 +798,11 @@ async function bytePlusReferences(generation, env) {
 
 async function dispatchBytePlusGeneration(env, generation, model, credential) {
   const base = bytePlusBase(env)
+  const timeoutMs = providerTimeoutMs(env, model.kind)
   if (model.kind === 'text') {
-    const result = await bytePlusRequest(`${base}/responses`, credential, env, {
-      method: 'POST', body: JSON.stringify({ model: model.endpoint, input: generation.prompt }),
+    const result = await bytePlusRequest(`${base}${textRequestPath(model)}`, credential, env, {
+      method: 'POST', kind: model.kind, timeoutMs,
+      body: JSON.stringify(textRequestBody(model, generation.prompt)),
     })
     return { asynchronous: false, result, requestId: result.id || null }
   }
@@ -708,7 +817,7 @@ async function dispatchBytePlusGeneration(env, generation, model, credential) {
       ...(generation.options?.quality === 'High' ? { size: '2K' } : {}),
       ...(images.length ? { image: images.length === 1 ? images[0] : images } : {}),
     }
-    const result = await bytePlusRequest(`${base}/images/generations`, credential, env, { method: 'POST', body: JSON.stringify(body) })
+    const result = await bytePlusRequest(`${base}/images/generations`, credential, env, { method: 'POST', kind: model.kind, timeoutMs, body: JSON.stringify(body) })
     return { asynchronous: false, result, requestId: result.id || null }
   }
   const body = {
@@ -719,10 +828,139 @@ async function dispatchBytePlusGeneration(env, generation, model, credential) {
     ...(generation.options?.quality ? { resolution: generation.options.quality } : {}),
     ...(generation.options?.duration ? { duration: Number(String(generation.options.duration).replace(/\D/g, '')) || undefined } : {}),
   }
-  const result = await bytePlusRequest(`${base}/contents/generations/tasks`, credential, env, { method: 'POST', body: JSON.stringify(body) })
+  const result = await bytePlusRequest(`${base}/contents/generations/tasks`, credential, env, { method: 'POST', kind: model.kind, timeoutMs, body: JSON.stringify(body) })
   if (!result.id) throw new Error('byteplus_task_id_missing')
   const statusUrl = `${base}/contents/generations/tasks/${encodeURIComponent(result.id)}`
   return { asynchronous: true, result, requestId: result.id, statusUrl }
+}
+
+function sseFrame(event, data) {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
+}
+
+// Chat-completions chunks carry choices[].delta.content; the responses API emits
+// typed output_text deltas. Both normalise to a plain string here.
+function streamTextDelta(payload) {
+  const delta = payload?.choices?.[0]?.delta
+  if (typeof delta?.content === 'string') return delta.content
+  if (Array.isArray(delta?.content)) return delta.content.map(part => (typeof part?.text === 'string' ? part.text : '')).join('')
+  if (payload?.type === 'response.output_text.delta' && typeof payload.delta === 'string') return payload.delta
+  return ''
+}
+
+async function* bytePlusTextStream(env, prompt, model, credential) {
+  const url = `${bytePlusBase(env)}${textRequestPath(model)}`
+  const timeoutMs = providerTimeoutMs(env, 'text', true)
+  const startedAt = Date.now()
+  let response
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${await decryptSecret(credential.encrypted_api_key, env)}`,
+        'content-type': 'application/json',
+        accept: 'text/event-stream',
+      },
+      body: JSON.stringify(textRequestBody(model, prompt, { stream: true })),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+  } catch (error) {
+    logProviderCall({ provider: 'byteplus', kind: 'text', path: requestPath(url), stream: true, ok: false, durationMs: Date.now() - startedAt, timeoutMs, error: String(error?.name || 'FetchError') })
+    throw providerFailure(error, timeoutMs)
+  }
+  if (!response.ok || !response.body) {
+    const data = await response.json().catch(() => ({}))
+    logProviderCall({ provider: 'byteplus', kind: 'text', path: requestPath(url), stream: true, ok: false, status: response.status, durationMs: Date.now() - startedAt })
+    throw new Error(data?.error?.message || data?.message || `byteplus_request_failed_${response.status}`)
+  }
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let firstDeltaMs = null
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let index = buffer.indexOf('\n')
+      while (index >= 0) {
+        const line = buffer.slice(0, index).trim()
+        buffer = buffer.slice(index + 1)
+        index = buffer.indexOf('\n')
+        if (!line.startsWith('data:')) continue
+        const raw = line.slice(5).trim()
+        if (!raw || raw === '[DONE]') continue
+        let payload
+        try {
+          payload = JSON.parse(raw)
+        } catch {
+          continue
+        }
+        const text = streamTextDelta(payload)
+        if (text && firstDeltaMs === null) firstDeltaMs = Date.now() - startedAt
+        yield { delta: text, requestId: payload?.id || null, usage: payload?.usage || null }
+      }
+    }
+  } finally {
+    await reader.cancel().catch(() => {})
+    logProviderCall({ provider: 'byteplus', kind: 'text', path: requestPath(url), stream: true, ok: true, status: response.status, firstDeltaMs, durationMs: Date.now() - startedAt })
+  }
+}
+
+// Streaming keeps the member-visible wait at time-to-first-token instead of the
+// full completion. The generation row is finalised before the stream closes so a
+// reload shows the same result the stream delivered.
+function streamTextGeneration(env, ctx, { generation, model, credential, origin }) {
+  const encoder = new TextEncoder()
+  const { readable, writable } = new TransformStream()
+  const writer = writable.getWriter()
+  const send = (event, data) => writer.write(encoder.encode(sseFrame(event, data)))
+
+  const work = async () => {
+    const startedAt = Date.now()
+    let text = ''
+    let usage = null
+    let requestId = null
+    try {
+      await send('meta', { generation: safeGeneration(generation) })
+      await run(env, `UPDATE generations SET provider_state = 'streaming', dispatched_at = ? WHERE id = ?`, nowIso(), generation.id)
+      for await (const chunk of bytePlusTextStream(env, generation.prompt, model, credential)) {
+        if (chunk.requestId) requestId = chunk.requestId
+        if (chunk.usage) usage = chunk.usage
+        if (!chunk.delta) continue
+        text += chunk.delta
+        await send('delta', { text: chunk.delta })
+      }
+      if (!text) throw new Error('provider_empty_response')
+      const result = {
+        id: requestId,
+        object: 'chat.completion',
+        choices: [{ index: 0, message: { role: 'assistant', content: text } }],
+        ...(usage ? { usage } : {}),
+      }
+      await run(env, `UPDATE generations SET status = 'complete', provider_request_id = ?, provider_state = 'succeeded', result_json = ?,
+        cost_nano_usd = estimated_cost_nano_usd, cost_source = CASE WHEN estimated_cost_nano_usd > 0 THEN 'catalog_estimate' ELSE 'pending_reconciliation' END,
+        completed_at = ?, provider_latency_ms = ?, last_provider_error = NULL WHERE id = ?`,
+        requestId, JSON.stringify(result), nowIso(), Date.now() - startedAt, generation.id)
+      const final = generationFromRow(await first(env, 'SELECT * FROM generations WHERE id = ? AND workspace_id = ?', generation.id, WORKSPACE_ID))
+      await attachReferences(env, [final])
+      await send('done', { generation: safeGeneration(final) })
+    } catch (error) {
+      const message = error instanceof Error ? error.message.slice(0, 500) : 'provider_stream_failed'
+      await run(env, `UPDATE generations SET status = 'failed', provider_state = 'stream_failed', error = ?, last_provider_error = ?,
+        completed_at = ?, provider_latency_ms = ? WHERE id = ?`,
+        message, providerDetail(error).slice(0, 500), nowIso(), Date.now() - startedAt, generation.id)
+      await send('error', { error: message }).catch(() => {})
+    } finally {
+      await writer.close().catch(() => {})
+    }
+  }
+
+  ctx.waitUntil(work())
+  return new Response(readable, {
+    status: 200,
+    headers: responseHeaders(origin, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' }),
+  })
 }
 
 async function generationContext(env, id) {
@@ -744,11 +982,13 @@ async function dispatchGeneration(env, context) {
       credential ? 'adapter_required' : 'credential_required', credential ? 'provider_adapter_required' : 'provider_credential_required', nowIso(), generation.id)
     return { done: true }
   }
+  const startedAt = Date.now()
   try {
     if (provider === 'fal.ai') {
       const queueBase = String(env.CRESCO_FAL_QUEUE_URL || 'https://queue.fal.run').replace(/\/$/, '')
       const data = await falRequest(`${queueBase}/${model.endpoint.replace(/^\/+/, '')}`, credential, env, {
         method: 'POST',
+        kind: model.kind,
         body: JSON.stringify(await falInput(generation, user, env)),
       })
       await run(env, `UPDATE generations SET provider_request_id = ?, provider_status_url = ?, provider_response_url = ?,
@@ -769,12 +1009,14 @@ async function dispatchGeneration(env, context) {
     }
     await run(env, `UPDATE generations SET status = 'complete', provider_request_id = ?, provider_state = 'succeeded', result_json = ?, result_url = ?,
       cost_nano_usd = estimated_cost_nano_usd, cost_source = CASE WHEN estimated_cost_nano_usd > 0 THEN 'catalog_estimate' ELSE 'pending_reconciliation' END,
-      dispatched_at = ?, completed_at = ?, last_provider_error = NULL WHERE id = ?`,
-      dispatched.requestId, JSON.stringify(dispatched.result), resultUrl(dispatched.result), nowIso(), nowIso(), generation.id)
+      dispatched_at = ?, completed_at = ?, provider_latency_ms = ?, last_provider_error = NULL WHERE id = ?`,
+      dispatched.requestId, JSON.stringify(dispatched.result), resultUrl(dispatched.result), nowIso(), nowIso(), Date.now() - startedAt, generation.id)
     return { done: true }
   } catch (error) {
-    await run(env, `UPDATE generations SET status = 'failed', provider_state = 'submission_failed', error = ?, completed_at = ? WHERE id = ?`,
-      error instanceof Error ? error.message.slice(0, 500) : 'provider_submission_failed', nowIso(), generation.id)
+    await run(env, `UPDATE generations SET status = 'failed', provider_state = 'submission_failed', error = ?, last_provider_error = ?,
+      completed_at = ?, provider_latency_ms = ? WHERE id = ?`,
+      error instanceof Error ? error.message.slice(0, 500) : 'provider_submission_failed',
+      providerDetail(error).slice(0, 500), nowIso(), Date.now() - startedAt, generation.id)
     return { done: true }
   }
 }
@@ -784,7 +1026,7 @@ async function reconcileGeneration(env, context) {
   if (!model || !credential || !generation.providerStatusUrl || !generation.providerResponseUrl) return { done: true }
   try {
     if (providerKey(model.provider) === 'byteplus') {
-      const result = await bytePlusRequest(generation.providerStatusUrl, credential, env)
+      const result = await bytePlusRequest(generation.providerStatusUrl, credential, env, { kind: 'poll' })
       const providerState = String(result.status || 'unknown').toLowerCase()
       const attempts = generation.pollAttempts + 1
       if (providerState === 'succeeded') {
@@ -807,11 +1049,11 @@ async function reconcileGeneration(env, context) {
         providerState, attempts, nowIso(), generation.id)
       return { done: false, retrySeconds: 20 }
     }
-    const status = await falRequest(generation.providerStatusUrl, credential, env)
+    const status = await falRequest(generation.providerStatusUrl, credential, env, { kind: 'poll' })
     const providerState = String(status.status || 'unknown').toLowerCase()
     const attempts = generation.pollAttempts + 1
     if (status.status === 'COMPLETED') {
-      const result = await falRequest(generation.providerResponseUrl, credential, env)
+      const result = await falRequest(generation.providerResponseUrl, credential, env, { kind: 'poll' })
       await run(env, `UPDATE generations SET status = 'complete', provider_state = ?, result_json = ?, result_url = ?,
         cost_nano_usd = estimated_cost_nano_usd, cost_source = CASE WHEN estimated_cost_nano_usd > 0 THEN 'catalog_estimate' ELSE 'pending_reconciliation' END,
         poll_attempts = ?, completed_at = ?, last_provider_error = NULL WHERE id = ?`,
@@ -833,7 +1075,7 @@ async function reconcileGeneration(env, context) {
   } catch (error) {
     const attempts = generation.pollAttempts + 1
     await run(env, `UPDATE generations SET poll_attempts = ?, last_provider_error = ?, last_provider_attempt_at = ? WHERE id = ?`,
-      attempts, error instanceof Error ? error.message.slice(0, 500) : 'provider_poll_failed', nowIso(), generation.id)
+      attempts, providerDetail(error).slice(0, 500), nowIso(), generation.id)
     return { done: attempts >= 180, retrySeconds: 60 }
   }
 }
@@ -1021,6 +1263,9 @@ async function route(request, env, ctx) {
     await audit(env, user, 'generation.submitted', id, { modelId: model.id })
     const generation = { id, userId: user.id, userEmail: user.email, title, modelId: model.id, modelName: model.name, modelProvider: model.provider, kind: model.kind, prompt, options, status: 'queued', costNanoUsd: 0, createdAt, references: [] }
     if (referenceIds.length) await attachReferences(env, [generation])
+    if (body.stream === true && model.kind === 'text' && providerKey(model.provider) === 'byteplus') {
+      return streamTextGeneration(env, ctx, { generation, model, credential, origin })
+    }
     const processing = await processGeneration(env, id)
     if (!processing.done) {
       ctx.waitUntil(enqueueGeneration(env, id, processing.retrySeconds || 20))
@@ -1117,16 +1362,20 @@ async function route(request, env, ctx) {
     const hasCredential = Boolean(await credentialFor(env, body.provider))
     const priceNanoUsd = toNanoUsd(body.priceUsd || 0)
     if (priceNanoUsd === null) throw new ApiError(400, 'invalid_model_price')
+    if (body.thinkingMode !== undefined && !THINKING_MODES.includes(body.thinkingMode)) throw new ApiError(400, 'invalid_thinking_mode')
+    if (body.textApi !== undefined && !TEXT_APIS.includes(body.textApi)) throw new ApiError(400, 'invalid_text_api')
     const created = {
       id: crypto.randomUUID(), name: String(body.name).trim().slice(0, 120), description: String(body.description || '').trim().slice(0, 500),
       provider: String(body.provider).trim().slice(0, 120), kind: body.kind, endpoint: String(body.endpoint || '').trim().slice(0, 300) || null,
-      status: hasCredential ? (body.status === 'beta' ? 'beta' : 'active') : 'disabled', priceNanoUsd, createdAt: nowIso(), archivedAt: null,
+      status: hasCredential ? (body.status === 'beta' ? 'beta' : 'active') : 'disabled', priceNanoUsd,
+      thinkingMode: body.thinkingMode || 'disabled', textApi: body.textApi || 'chat_completions',
+      createdAt: nowIso(), archivedAt: null,
     }
     await run(env, `INSERT INTO models
-      (id, workspace_id, name, description, provider, kind, endpoint, status, price_nano_usd, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, created.id, WORKSPACE_ID, created.name, created.description, created.provider, created.kind, created.endpoint, created.status, created.priceNanoUsd, created.createdAt)
+      (id, workspace_id, name, description, provider, kind, endpoint, status, price_nano_usd, thinking_mode, text_api, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, created.id, WORKSPACE_ID, created.name, created.description, created.provider, created.kind, created.endpoint, created.status, created.priceNanoUsd, created.thinkingMode, created.textApi, created.createdAt)
     await audit(env, user, 'model.created', created.id, { provider: created.provider, kind: created.kind, credentialUpdated: Boolean(apiKey) })
-    return json({ model: (await safeModels(env, [{ ...created, price_nano_usd: priceNanoUsd, created_at: created.createdAt, archived_at: null }]))[0] }, 201, origin)
+    return json({ model: (await safeModels(env, [{ ...created, price_nano_usd: priceNanoUsd, thinking_mode: created.thinkingMode, text_api: created.textApi, created_at: created.createdAt, archived_at: null }]))[0] }, 201, origin)
   }
 
   if (request.method === 'GET' && path === '/v1/admin/providers') {
@@ -1151,13 +1400,17 @@ async function route(request, env, ctx) {
       priceNanoUsd = toNanoUsd(body.priceUsd)
       if (priceNanoUsd === null) throw new ApiError(400, 'invalid_model_price')
     }
+    if (body.thinkingMode !== undefined && !THINKING_MODES.includes(body.thinkingMode)) throw new ApiError(400, 'invalid_thinking_mode')
+    if (body.textApi !== undefined && !TEXT_APIS.includes(body.textApi)) throw new ApiError(400, 'invalid_text_api')
+    const thinking = body.thinkingMode !== undefined ? body.thinkingMode : target.thinkingMode
+    const api = body.textApi !== undefined ? body.textApi : target.textApi
     const apiKey = String(body.apiKey || '').trim()
     if (apiKey) await storeCredential(env, provider, apiKey)
-    await run(env, 'UPDATE models SET name = ?, description = ?, provider = ?, kind = ?, endpoint = ?, status = ?, price_nano_usd = ? WHERE id = ?',
-      name, description, provider, kind, endpoint, status, priceNanoUsd, target.id)
-    const updated = { ...target, name, description, provider, kind, endpoint, status, priceNanoUsd }
+    await run(env, 'UPDATE models SET name = ?, description = ?, provider = ?, kind = ?, endpoint = ?, status = ?, price_nano_usd = ?, thinking_mode = ?, text_api = ? WHERE id = ?',
+      name, description, provider, kind, endpoint, status, priceNanoUsd, thinking, api, target.id)
+    const updated = { ...target, name, description, provider, kind, endpoint, status, priceNanoUsd, thinkingMode: thinking, textApi: api }
     await audit(env, user, 'model.updated', target.id, { status, provider, kind, credentialUpdated: Boolean(apiKey) })
-    return json({ model: (await safeModels(env, [{ ...updated, price_nano_usd: priceNanoUsd, created_at: updated.createdAt, archived_at: null }]))[0] }, 200, origin)
+    return json({ model: (await safeModels(env, [{ ...updated, price_nano_usd: priceNanoUsd, thinking_mode: thinking, text_api: api, created_at: updated.createdAt, archived_at: null }]))[0] }, 200, origin)
   }
 
   if (modelMatch && request.method === 'DELETE') {
@@ -1270,9 +1523,15 @@ export const __test = {
   decryptSecret,
   encryptSecret,
   hashPassword,
+  isTimeoutError,
+  providerFailure,
   providerOutputText,
   providerKey,
+  providerTimeoutMs,
   resultUrl,
+  streamTextDelta,
+  textRequestBody,
+  textRequestPath,
   signToken,
   toNanoUsd,
   verifyPassword,

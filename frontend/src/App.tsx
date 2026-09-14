@@ -5,7 +5,7 @@ import {
   MoreHorizontal, Plus, Search, Settings, ShieldCheck, SlidersHorizontal,
   Sparkles, Upload, Users, WandSparkles, X,
 } from 'lucide-react'
-import { clearSession, getGeneration, getWorkspaceData, login as apiLogin, restoreSession, submitGeneration, updateMe, uploadReference, type ApiBalance, type ApiGeneration, type ApiUpload, type SessionUser, type UsageSummary } from './api'
+import { clearSession, generationErrorMessage, getGeneration, getWorkspaceData, login as apiLogin, restoreSession, streamGeneration, submitGeneration, updateMe, uploadReference, type ApiBalance, type ApiGeneration, type ApiUpload, type SessionUser, type UsageSummary } from './api'
 
 type View = 'home' | 'history' | 'usage' | 'settings'
 type ModelKind = 'Text' | 'Image' | 'Video'
@@ -446,6 +446,7 @@ function Toggle({ label, detail, checked, onChange }: { label: string; detail: s
 function ModelWorkspace({ model, onClose, onSubmitted }: { model: Model; onClose: () => void; onSubmitted: (item: Activity) => void }) {
   const [prompt, setPrompt] = useState('')
   const [generation, setGeneration] = useState<ApiGeneration | null>(null)
+  const [streamText, setStreamText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [aspect, setAspect] = useState(model.kind === 'Image' ? '1:1' : '16:9')
@@ -485,11 +486,26 @@ function ModelWorkspace({ model, onClose, onSubmitted }: { model: Model; onClose
       setError(reason instanceof Error ? reason.message : 'Could not upload this reference.')
     } finally { setUploading(false) }
   }
+  const summarise = (response: ApiGeneration) => ({
+    id: response.id, title: response.title, model: model.name, date: 'Just now', kind: model.kind, color: model.color,
+    cost: money(Number(response.costNanoUsd || 0) / 1_000_000_000),
+    status: response.status === 'complete' ? 'Complete' : response.status === 'failed' ? 'Failed' : 'Processing',
+    prompt: response.prompt, resultUrl: response.resultUrl, outputText: response.outputText, createdAt: response.createdAt,
+  })
   const generate = async () => {
     if (!prompt.trim()) return
-    setBusy(true); setError('')
+    setBusy(true); setError(''); setStreamText('')
     try {
       const options: Record<string, string> = model.kind === 'Video' ? { aspect, quality, duration } : model.kind === 'Image' ? { aspect, quality } : { depth, length }
+      if (model.kind === 'Text') {
+        const final = await streamGeneration(model.id, prompt.trim(), options, references.map(item => item.id), {
+          onMeta: started => setGeneration(started),
+          onDelta: chunk => setStreamText(value => value + chunk),
+        })
+        setGeneration(final)
+        onSubmitted(summarise(final) as Activity)
+        return
+      }
       const response = (await submitGeneration(model.id, prompt.trim(), options, references.map(item => item.id))).generation
       setGeneration(response)
       onSubmitted({ id: response.id, title: response.title, model: model.name, date: 'Just now', kind: model.kind, color: model.color, cost: money(Number(response.costNanoUsd || 0) / 1_000_000_000), status: response.status === 'complete' ? 'Complete' : response.status === 'failed' ? 'Failed' : 'Processing', prompt: response.prompt, resultUrl: response.resultUrl, outputText: response.outputText, createdAt: response.createdAt })
@@ -497,6 +513,7 @@ function ModelWorkspace({ model, onClose, onSubmitted }: { model: Model; onClose
       setError(reason instanceof Error ? reason.message : 'Could not send this request.')
     } finally { setBusy(false) }
   }
+  const failureMessage = generation?.error ? generationErrorMessage(generation.error) : 'The provider could not complete this request.'
   return <div className="modal-backdrop" onClick={onClose}><section className="modal workspace-modal" onClick={event => event.stopPropagation()}>
     <button className="close-button" onClick={onClose} aria-label="Close workspace"><X size={18}/></button>
     <div className={cx('modal-icon', model.color)}><Icon size={25}/></div>
@@ -513,7 +530,8 @@ function ModelWorkspace({ model, onClose, onSubmitted }: { model: Model; onClose
     {model.kind !== 'Text' && <><label className={cx('upload-hint', uploading && 'uploading')}><Upload size={15}/> {uploading ? 'Uploading reference…' : `Add reference ${model.kind === 'Video' ? 'images, video or audio' : 'image'}`} <span>{references.length}/5</span><input type="file" multiple accept={model.kind === 'Video' ? 'image/*,video/*,audio/*' : 'image/*'} disabled={uploading || references.length >= 5} onChange={event => { void addReferences(event.target.files); event.target.value = '' }} hidden/></label>{references.length > 0 && <div className="reference-list">{references.map(reference => <div className="reference-chip" key={reference.id}><div><strong>{reference.fileName}</strong><span>{(reference.size / 1024 / 1024).toFixed(reference.size > 1024 * 1024 ? 1 : 2)} MB</span></div><button onClick={() => setReferences(items => items.filter(item => item.id !== reference.id))} aria-label={`Remove ${reference.fileName}`}><X size={13}/></button></div>)}</div>}</>}
     {error && <div className="login-error">{error}</div>}
     {generation?.status === 'queued' && <div className="result-preview processing"><span className="result-spinner"/><div><strong>Provider is processing</strong><span>Your request was sent immediately. This page will update as soon as the result is ready.</span></div></div>}
-    {generation?.status === 'failed' && <div className="result-preview failed"><X size={17}/><div><strong>Request failed</strong><span>{generation.error || 'The provider could not complete this request.'}</span></div></div>}
+    {streamText && generation?.status !== 'complete' && <div className="inline-result"><div className="inline-result-head"><Sparkles size={19}/><div><strong>Responding…</strong><span>Streaming from {model.provider}</span></div></div><div className="inline-result-text">{streamText}</div></div>}
+    {generation?.status === 'failed' && <div className="result-preview failed"><X size={17}/><div><strong>Request failed</strong><span>{failureMessage}</span></div></div>}
     {generation?.status === 'complete' && <div className="inline-result"><div className="inline-result-head"><Sparkles size={19}/><div><strong>Result ready</strong><span>Returned by {model.provider}</span></div></div>{generation.outputText && <div className="inline-result-text">{generation.outputText}</div>}{generation.resultUrl && model.kind === 'Image' && <img className="inline-result-media" src={generation.resultUrl} alt={`${model.name} result`}/>} {generation.resultUrl && model.kind === 'Video' && <video className="inline-result-media" src={generation.resultUrl} controls playsInline/>}{generation.resultUrl && <div className="inline-result-actions"><button className="inline-result-link primary-download" onClick={() => void downloadResult(generation.resultUrl!, generation.id, model.kind)}><Download size={15}/> Download</button><a className="inline-result-link" href={generation.resultUrl} target="_blank" rel="noreferrer"><ArrowUpRight size={15}/> Open original</a></div>}</div>}
     <div className="workspace-footer"><span>Estimated cost · <strong>{model.estimate}</strong></span><button className="primary-button" disabled={!prompt.trim()||busy||uploading} onClick={generate}><Sparkles size={15}/> {busy?'Sending…':generation?.status==='queued'?'Send another':'Generate'}</button></div>
   </section></div>

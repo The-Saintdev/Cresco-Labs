@@ -23,11 +23,27 @@ async function waitForHealth(url) {
 test('login, authorization, and usage summary', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'cresco-api-'))
   let providerBase = ''
+  const bytePlusTextBodies = []
   const providerServer = createServer(async (request, response) => {
     const requestUrl = new URL(request.url || '/', providerBase || 'http://127.0.0.1')
     const bytePlusRequest = requestUrl.pathname.startsWith('/byteplus/')
     const expectedAuthorization = bytePlusRequest ? 'Bearer byteplus-secret-value' : 'Key provider-secret-value'
     if (request.headers.authorization !== expectedAuthorization) { response.writeHead(401); return response.end('{}') }
+    if (requestUrl.pathname === '/byteplus/chat/completions' && request.method === 'POST') {
+      let raw = ''
+      for await (const chunk of request) raw += chunk
+      const body = JSON.parse(raw || '{}')
+      bytePlusTextBodies.push(body)
+      if (!body.stream) {
+        response.setHeader('content-type', 'application/json')
+        return response.end(JSON.stringify({ id: 'bp-chat-1', choices: [{ index: 0, message: { role: 'assistant', content: 'BytePlus chat response' } }] }))
+      }
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.write('data: ' + JSON.stringify({ id: 'bp-stream-1', choices: [{ delta: { content: 'Streamed ' } }] }) + '\n\n')
+      response.write('data: ' + JSON.stringify({ id: 'bp-stream-1', choices: [{ delta: { content: 'answer.' } }] }) + '\n\n')
+      response.write('data: [DONE]\n\n')
+      return response.end()
+    }
     response.setHeader('content-type', 'application/json')
     if (requestUrl.pathname === '/byteplus/responses' && request.method === 'POST') return response.end(JSON.stringify({ id: 'bp-text-1', output_text: 'BytePlus text response' }))
     if (requestUrl.pathname === '/byteplus/contents/generations/tasks' && request.method === 'POST') return response.end(JSON.stringify({ id: 'bp-video-1' }))
@@ -155,7 +171,43 @@ test('login, authorization, and usage summary', async () => {
     const bytePlusText = await bytePlusTextResponse.json()
     assert.equal(bytePlusTextResponse.status, 201)
     assert.equal(bytePlusText.generation.status, 'complete')
-    assert.equal(bytePlusText.generation.outputText, 'BytePlus text response')
+    assert.equal(bytePlusText.generation.outputText, 'BytePlus chat response')
+    assert.equal(typeof bytePlusText.generation.providerLatencyMs, 'number')
+    assert.deepEqual(bytePlusTextBodies[0].messages, [{ role: 'user', content: 'Test direct BytePlus text output.' }])
+    assert.deepEqual(bytePlusTextBodies[0].thinking, { type: 'disabled' })
+
+    const streamResponse = await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: bytePlusTextModel.model.id, prompt: 'Stream this answer.', stream: true }),
+    })
+    assert.equal(streamResponse.status, 200)
+    assert.match(streamResponse.headers.get('content-type') || '', /text\/event-stream/)
+    const streamBody = await streamResponse.text()
+    assert.match(streamBody, /event: meta/)
+    assert.match(streamBody, /event: done/)
+    const deltas = [...streamBody.matchAll(/event: delta\ndata: (.*)/g)].map(match => JSON.parse(match[1]).text)
+    assert.deepEqual(deltas, ['Streamed ', 'answer.'])
+    const streamedGeneration = JSON.parse(streamBody.split('event: done\ndata: ')[1].split('\n')[0]).generation
+    assert.equal(streamedGeneration.status, 'complete')
+    assert.equal(streamedGeneration.outputText, 'Streamed answer.')
+    assert.equal(streamedGeneration.lastProviderError, undefined)
+
+    const responsesApiModel = await (await fetch(baseUrl + '/v1/admin/models', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'BytePlus Responses', provider: 'BytePlus', kind: 'text', endpoint: 'seed-2-0-lite-260228', priceUsd: 0, textApi: 'responses', thinkingMode: 'auto' }),
+    })).json()
+    assert.equal(responsesApiModel.model.textApi, 'responses')
+    const responsesGeneration = await (await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: responsesApiModel.model.id, prompt: 'Use the responses API.' }),
+    })).json()
+    assert.equal(responsesGeneration.generation.outputText, 'BytePlus text response')
+
+    const rejectedSetting = await fetch(baseUrl + '/v1/admin/models', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Bad Setting', provider: 'BytePlus', kind: 'text', endpoint: 'x', priceUsd: 0, thinkingMode: 'maybe' }),
+    })
+    assert.equal(rejectedSetting.status, 400)
     assert.equal(bytePlusText.generation.modelProvider, 'BytePlus')
     const bytePlusVideoModelResponse = await fetch(baseUrl + '/v1/admin/models', {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
@@ -222,7 +274,7 @@ test('login, authorization, and usage summary', async () => {
     const usageResponse = await fetch(baseUrl + '/v1/usage/summary', { headers })
     const usage = await usageResponse.json()
     assert.equal(usageResponse.status, 200)
-    assert.equal(usage.byModel.length, 8)
+    assert.equal(usage.byModel.length, 9)
 
     const queueResponse = await fetch(baseUrl + '/v1/generations', {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
