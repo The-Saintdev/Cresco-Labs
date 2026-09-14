@@ -552,7 +552,7 @@ button:disabled { cursor: not-allowed; }
 .search-inline input { flex: 1; border: 0; background: none; outline: none; font-size: 13px; min-width: 0; }
 .search-inline:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
 
-.segmented { display: inline-flex; padding: 2px; gap: 2px; background: var(--bg-sunken); border-radius: var(--radius); border: 1px solid var(--border); }
+.segmented { display: inline-flex; align-self: flex-start; padding: 2px; gap: 2px; background: var(--bg-sunken); border-radius: var(--radius); border: 1px solid var(--border); }
 .segmented button {
   height: 26px; padding: 0 10px; border-radius: var(--radius-sm);
   font-size: 12px; font-weight: 500; color: var(--text-muted);
