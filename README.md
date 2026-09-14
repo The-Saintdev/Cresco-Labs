@@ -59,6 +59,38 @@ pnpm team:mobile
 pnpm admin:mobile
 ```
 
+## Mobile builds and updates
+
+Both apps use `expo-updates`, so JavaScript and asset changes reach installed
+apps over the air. Native changes — a new native module, an Expo SDK bump,
+permissions, icons, or anything in the `android`/`ios` sections of `app.json` —
+still need a new build.
+
+An update only reaches a device whose build listens to the same channel, and
+whose runtime version matches. `runtimeVersion` uses the `nativeVersion` policy,
+so it is derived from `version` plus the native build number.
+
+| Installed from | Channel | Publish updates with |
+| --- | --- | --- |
+| `eas build --profile preview` (APK, internal distribution) | `preview` | `eas update --branch preview` |
+| `eas build --profile production` (store build) | `production` | `eas update --branch production` |
+
+Publishing to the wrong branch is silent: the command succeeds and no device
+ever sees it. When in doubt, `eas build:list` shows the profile each installed
+build came from.
+
+To install on a device from scratch, build rather than update — a fresh build
+carries the current bundle and skips the channel and runtime-version matching
+entirely:
+
+```bash
+cd team-app && eas build --profile preview --platform android
+```
+
+`expo.platforms` is set to `ios` and `android` in both apps. Without it the
+export also targets web, which needs `react-native-web` and fails, since the web
+client here is the separate Vite app.
+
 Create a production web build:
 
 ```bash
