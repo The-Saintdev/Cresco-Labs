@@ -203,6 +203,40 @@ test('login, authorization, and usage summary', async () => {
     })).json()
     assert.equal(responsesGeneration.generation.outputText, 'BytePlus text response')
 
+    const firstThread = await (await fetch(baseUrl + '/v1/sessions', { headers })).json()
+    const glmThreads = firstThread.sessions.filter(item => item.modelId === bytePlusTextModel.model.id)
+    assert.equal(glmThreads.length, 2, 'each generation sent without a sessionId opens its own thread')
+    const glmThread = glmThreads.find(item => item.title === 'Test direct BytePlus text output.')
+    assert.ok(glmThread, 'a thread is titled after the prompt that opened it')
+    assert.equal(glmThread.generationCount, 1)
+    assert.ok(glmThreads.some(item => item.title === 'Stream this answer.'), 'streamed runs are threaded too')
+
+    const followUp = await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: bytePlusTextModel.model.id, prompt: 'A follow up in the same thread.', sessionId: glmThread.id }),
+    })
+    assert.equal(followUp.status, 201)
+    const threadDetail = await (await fetch(baseUrl + '/v1/sessions/' + glmThread.id, { headers })).json()
+    assert.equal(threadDetail.generations.length, 2)
+    assert.equal(threadDetail.generations[0].prompt, 'Test direct BytePlus text output.')
+    assert.equal(threadDetail.generations[1].prompt, 'A follow up in the same thread.')
+
+    const renamed = await fetch(baseUrl + '/v1/sessions/' + glmThread.id, {
+      method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Timeout debugging' }),
+    })
+    assert.equal((await renamed.json()).session.title, 'Timeout debugging')
+
+    const wrongModelThread = await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: createdModel.model.id, prompt: 'Wrong model for this thread.', sessionId: glmThread.id }),
+    })
+    assert.equal(wrongModelThread.status, 400, 'a thread refuses generations from another model')
+
+    const archived = await fetch(baseUrl + '/v1/sessions/' + glmThread.id, { method: 'DELETE', headers })
+    assert.equal(archived.status, 200)
+    const afterArchive = await (await fetch(baseUrl + '/v1/sessions', { headers })).json()
+    assert.equal(afterArchive.sessions.some(item => item.id === glmThread.id), false)
+
     const rejectedSetting = await fetch(baseUrl + '/v1/admin/models', {
       method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'Bad Setting', provider: 'BytePlus', kind: 'text', endpoint: 'x', priceUsd: 0, thinkingMode: 'maybe' }),

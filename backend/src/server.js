@@ -38,6 +38,7 @@ let databaseMigrated = false
 if (!db.credentials) { db.credentials = []; databaseMigrated = true }
 if (!db.uploads) { db.uploads = []; databaseMigrated = true }
 if (!db.providerUsage) { db.providerUsage = []; databaseMigrated = true }
+if (!db.sessions) { db.sessions = []; databaseMigrated = true }
 if (!db.policies) {
   db.policies = { workspaceMonthlyLimitNanoUsd: 0, perGenerationLimitNanoUsd: 0, warnAtPercent: 80 }
   databaseMigrated = true
@@ -200,6 +201,36 @@ function safeModel(model) {
   const credentialConfigured = Boolean(credentialFor(model.provider))
   const adapterConfigured = ['fal.ai', 'byteplus'].includes(providerKey(model.provider))
   return { ...model, credentialConfigured, adapterConfigured, executionReady: Boolean(credentialConfigured && adapterConfigured && model.endpoint && model.status !== 'disabled') }
+}
+
+// A thread is named after whatever started it, the way a chat client does.
+function sessionTitleFrom(prompt) {
+  const cleaned = String(prompt || '').replace(/\s+/g, ' ').trim()
+  if (!cleaned) return 'New chat'
+  return cleaned.length > 60 ? `${cleaned.slice(0, 57)}…` : cleaned
+}
+
+function safeSession(session, extra = {}) {
+  if (!session) return null
+  const { userId: _userId, archivedAt: _archivedAt, ...safe } = session
+  return { ...safe, ...extra }
+}
+
+function sessionCount(sessionId) {
+  return db.generations.filter(item => item.sessionId === sessionId).length
+}
+
+function sessionFor(user, model, sessionId, prompt) {
+  if (sessionId) {
+    const existing = db.sessions.find(item => item.id === sessionId && !item.archivedAt)
+    if (!existing || existing.userId !== user.id) return { error: 'session_not_found', status: 404 }
+    if (existing.modelId !== model.id) return { error: 'session_model_mismatch', status: 400 }
+    return { session: existing }
+  }
+  const timestamp = new Date().toISOString()
+  const created = { id: randomUUID(), userId: user.id, modelId: model.id, title: sessionTitleFrom(prompt), createdAt: timestamp, updatedAt: timestamp, archivedAt: null }
+  db.sessions.unshift(created)
+  return { session: created }
 }
 
 function safeGeneration(generation) {
@@ -758,7 +789,7 @@ async function* bytePlusTextStream(prompt, model, credential) {
 // Streaming keeps the member-visible wait at time-to-first-token instead of the
 // full completion. The record is finalised before the stream closes so a reload
 // shows the same result the stream delivered.
-async function streamTextGeneration(response, origin, generation, model, credential) {
+async function streamTextGeneration(response, origin, generation, model, credential, session) {
   const headers = {
     'content-type': 'text/event-stream; charset=utf-8',
     'cache-control': 'no-cache, no-transform',
@@ -777,7 +808,7 @@ async function streamTextGeneration(response, origin, generation, model, credent
   let usage = null
   let requestId = null
   try {
-    response.write(sseFrame('meta', { generation: safeGeneration(generation) }))
+    response.write(sseFrame('meta', { generation: safeGeneration(generation), session: safeSession(session) }))
     generation.providerState = 'streaming'
     generation.dispatchedAt = new Date().toISOString()
     for await (const chunk of bytePlusTextStream(generation.prompt, model, credential)) {
@@ -1013,6 +1044,52 @@ const server = createServer(async (request, response) => {
       if (user.role !== 'admin' && generation.userEmail !== user.email) return send(response, 404, { error: 'generation_not_found' }, origin)
       return send(response, 200, { generation: safeGeneration(generation) }, origin)
     }
+    if (path === '/v1/sessions' && request.method === 'GET') {
+      const modelId = url.searchParams.get('modelId')
+      const sessions = db.sessions
+        .filter(item => item.userId === user.id && !item.archivedAt && (!modelId || item.modelId === modelId))
+        .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+        .slice(0, 50)
+        .map(item => safeSession(item, { generationCount: sessionCount(item.id) }))
+      return send(response, 200, { sessions }, origin)
+    }
+
+    if (path === '/v1/sessions' && request.method === 'POST') {
+      const body = await readBody(request)
+      const model = db.models.find(item => item.id === body.modelId && item.status !== 'disabled' && !item.archivedAt)
+      if (!model) return send(response, 400, { error: 'model_required' }, origin)
+      const result = sessionFor(user, model, null, body.title)
+      await persist()
+      return send(response, 201, { session: safeSession(result.session, { generationCount: 0 }) }, origin)
+    }
+
+    const sessionMatch = path.match(/^\/v1\/sessions\/([^/]+)$/)
+    if (sessionMatch) {
+      const session = db.sessions.find(item => item.id === decodeURIComponent(sessionMatch[1]))
+      if (!session || session.userId !== user.id || session.archivedAt) return send(response, 404, { error: 'session_not_found' }, origin)
+      if (request.method === 'GET') {
+        const generations = db.generations
+          .filter(item => item.sessionId === session.id)
+          .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+          .map(safeGeneration)
+        return send(response, 200, { session: safeSession(session, { generationCount: generations.length }), generations }, origin)
+      }
+      if (request.method === 'PATCH') {
+        const body = await readBody(request)
+        const title = String(body.title || '').trim().slice(0, 120)
+        if (!title) return send(response, 400, { error: 'title_required' }, origin)
+        session.title = title
+        session.updatedAt = new Date().toISOString()
+        await persist()
+        return send(response, 200, { session: safeSession(session) }, origin)
+      }
+      if (request.method === 'DELETE') {
+        session.archivedAt = new Date().toISOString()
+        await persist()
+        return send(response, 200, { archived: true }, origin)
+      }
+    }
+
     if (request.method === 'POST' && path === '/v1/generations') {
       const body = await readBody(request)
       const model = db.models.find(item => item.id === body.modelId && item.status !== 'disabled')
@@ -1033,8 +1110,11 @@ const server = createServer(async (request, response) => {
         return !upload || (user.role !== 'admin' && upload.ownerEmail !== user.email)
       })
       if (invalidReference) return send(response, 400, { error: 'invalid_reference' }, origin)
+      const attached = sessionFor(user, model, body.sessionId, prompt)
+      if (attached.error) return send(response, attached.status, { error: attached.error }, origin)
+      attached.session.updatedAt = new Date().toISOString()
       const created = {
-        id: randomUUID(), userEmail: user.email, title: String(body.title || prompt.slice(0, 64) || 'Untitled generation').trim(),
+        id: randomUUID(), userEmail: user.email, sessionId: attached.session.id, title: String(body.title || prompt.slice(0, 64) || 'Untitled generation').trim(),
         modelId: model.id, modelName: model.name, modelProvider: model.provider, kind: model.kind, prompt, status: 'queued', costNanoUsd: 0,
         options: body.options && typeof body.options === 'object' && !Array.isArray(body.options) ? body.options : {},
         referenceIds,
@@ -1043,7 +1123,7 @@ const server = createServer(async (request, response) => {
       db.generations.unshift(created)
       await audit(user, 'generation.submitted', created.id, { modelId: model.id })
       if (body.stream === true && model.kind === 'text' && providerKey(model.provider) === 'byteplus') {
-        return streamTextGeneration(response, origin, created, model, credentialFor(model.provider))
+        return streamTextGeneration(response, origin, created, model, credentialFor(model.provider), attached.session)
       }
       await dispatchGeneration(created, model, user)
       return send(response, created.status === 'complete' ? 201 : 202, { generation: safeGeneration(created) }, origin)

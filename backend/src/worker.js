@@ -281,6 +281,52 @@ function modelFromRow(row) {
   }
 }
 
+function sessionFromRow(row) {
+  if (!row) return null
+  return {
+    id: row.id,
+    userId: row.user_id,
+    modelId: row.model_id,
+    title: row.title,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    archivedAt: row.archived_at,
+  }
+}
+
+function safeSession(session, extra = {}) {
+  if (!session) return null
+  const { userId: _userId, archivedAt: _archivedAt, ...safe } = session
+  return { ...safe, ...extra }
+}
+
+// A thread is named after whatever started it, the way a chat client does.
+function sessionTitleFrom(prompt) {
+  const cleaned = String(prompt || '').replace(/\s+/g, ' ').trim()
+  if (!cleaned) return 'New chat'
+  return cleaned.length > 60 ? `${cleaned.slice(0, 57)}…` : cleaned
+}
+
+async function sessionFor(env, user, model, sessionId, prompt) {
+  if (sessionId) {
+    const existing = sessionFromRow(await first(env,
+      'SELECT * FROM generation_sessions WHERE id = ? AND workspace_id = ? AND archived_at IS NULL', String(sessionId), WORKSPACE_ID))
+    if (!existing || existing.userId !== user.id) throw new ApiError(404, 'session_not_found')
+    if (existing.modelId !== model.id) throw new ApiError(400, 'session_model_mismatch')
+    return existing
+  }
+  const id = crypto.randomUUID()
+  const timestamp = nowIso()
+  await run(env, `INSERT INTO generation_sessions (id, workspace_id, user_id, model_id, title, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`, id, WORKSPACE_ID, user.id, model.id, sessionTitleFrom(prompt), timestamp, timestamp)
+  return { id, userId: user.id, modelId: model.id, title: sessionTitleFrom(prompt), createdAt: timestamp, updatedAt: timestamp, archivedAt: null }
+}
+
+async function touchSession(env, sessionId) {
+  if (!sessionId) return
+  await run(env, 'UPDATE generation_sessions SET updated_at = ? WHERE id = ? AND workspace_id = ?', nowIso(), sessionId, WORKSPACE_ID)
+}
+
 function uploadFromRow(row) {
   if (!row) return null
   return {
@@ -327,6 +373,7 @@ function generationFromRow(row) {
     lastProviderAttemptAt: row.last_provider_attempt_at,
     pollAttempts: Number(row.poll_attempts || 0),
     providerLatencyMs: row.provider_latency_ms === null || row.provider_latency_ms === undefined ? null : Number(row.provider_latency_ms),
+    sessionId: row.session_id || null,
     createdAt: row.created_at,
     dispatchedAt: row.dispatched_at,
     completedAt: row.completed_at,
@@ -954,7 +1001,7 @@ async function* bytePlusTextStream(env, prompt, model, credential) {
 // Streaming keeps the member-visible wait at time-to-first-token instead of the
 // full completion. The generation row is finalised before the stream closes so a
 // reload shows the same result the stream delivered.
-function streamTextGeneration(env, ctx, { generation, model, credential, origin }) {
+function streamTextGeneration(env, ctx, { generation, model, credential, origin, session }) {
   const encoder = new TextEncoder()
   const { readable, writable } = new TransformStream()
   const writer = writable.getWriter()
@@ -966,7 +1013,7 @@ function streamTextGeneration(env, ctx, { generation, model, credential, origin 
     let usage = null
     let requestId = null
     try {
-      await send('meta', { generation: safeGeneration(generation) })
+      await send('meta', { generation: safeGeneration(generation), session: safeSession(session) })
       await run(env, `UPDATE generations SET provider_state = 'streaming', dispatched_at = ? WHERE id = ?`, nowIso(), generation.id)
       for await (const chunk of bytePlusTextStream(env, generation.prompt, model, credential)) {
         if (chunk.requestId) requestId = chunk.requestId
@@ -1260,6 +1307,62 @@ async function route(request, env, ctx) {
     return json({ upload: safeUpload(upload) }, 200, origin)
   }
 
+  if (path === '/v1/sessions' && request.method === 'GET') {
+    const modelId = url.searchParams.get('modelId')
+    const bindings = [WORKSPACE_ID, user.id]
+    let clause = 'workspace_id = ? AND user_id = ? AND archived_at IS NULL'
+    if (modelId) {
+      clause += ' AND model_id = ?'
+      bindings.push(modelId)
+    }
+    bindings.push(pageLimit(url, 50))
+    const rows = await all(env, `SELECT s.*, (SELECT COUNT(*) FROM generations g WHERE g.session_id = s.id) AS generation_count
+      FROM generation_sessions s WHERE ${clause} ORDER BY updated_at DESC LIMIT ?`, ...bindings)
+    return json({ sessions: rows.map(row => safeSession(sessionFromRow(row), { generationCount: Number(row.generation_count || 0) })) }, 200, origin)
+  }
+
+  if (path === '/v1/sessions' && request.method === 'POST') {
+    const body = await readJson(request)
+    const model = modelFromRow(await first(env, "SELECT * FROM models WHERE id = ? AND workspace_id = ? AND archived_at IS NULL AND status != 'disabled'", String(body.modelId || ''), WORKSPACE_ID))
+    if (!model) throw new ApiError(400, 'model_required')
+    const session = await sessionFor(env, user, model, null, body.title)
+    return json({ session: safeSession(session, { generationCount: 0 }) }, 201, origin)
+  }
+
+  const sessionMatch = path.match(/^\/v1\/sessions\/([^/]+)$/)
+  if (sessionMatch) {
+    const sessionId = decodeURIComponent(sessionMatch[1])
+    const session = sessionFromRow(await first(env, 'SELECT * FROM generation_sessions WHERE id = ? AND workspace_id = ?', sessionId, WORKSPACE_ID))
+    if (!session || session.userId !== user.id || session.archivedAt) throw new ApiError(404, 'session_not_found')
+
+    if (request.method === 'GET') {
+      const rows = await all(env, 'SELECT * FROM generations WHERE session_id = ? AND workspace_id = ? ORDER BY created_at ASC LIMIT 200', sessionId, WORKSPACE_ID)
+      let generations = rows.map(generationFromRow)
+      const advancing = generations.filter(readyToAdvance).slice(0, MAX_ADVANCE_PER_READ)
+      if (advancing.length) {
+        await Promise.all(advancing.map(item => processGeneration(env, item.id).catch(error => console.error('advance_failed', item.id, error))))
+        const refreshed = await all(env, 'SELECT * FROM generations WHERE session_id = ? AND workspace_id = ? ORDER BY created_at ASC LIMIT 200', sessionId, WORKSPACE_ID)
+        generations = refreshed.map(generationFromRow)
+      }
+      await attachReferences(env, generations)
+      return json({ session: safeSession(session, { generationCount: generations.length }), generations: generations.map(safeGeneration) }, 200, origin)
+    }
+
+    if (request.method === 'PATCH') {
+      const body = await readJson(request)
+      const title = String(body.title || '').trim().slice(0, 120)
+      if (!title) throw new ApiError(400, 'title_required')
+      await run(env, 'UPDATE generation_sessions SET title = ?, updated_at = ? WHERE id = ?', title, nowIso(), sessionId)
+      return json({ session: safeSession({ ...session, title }) }, 200, origin)
+    }
+
+    if (request.method === 'DELETE') {
+      // Archived, not deleted: the generations and their spend stay attributable.
+      await run(env, 'UPDATE generation_sessions SET archived_at = ? WHERE id = ?', nowIso(), sessionId)
+      return json({ archived: true }, 200, origin)
+    }
+  }
+
   if (request.method === 'GET' && path === '/v1/history') return json(await historyPage(env, user, url), 200, origin)
   if (request.method === 'GET' && path === '/v1/usage/summary') return json(await usageSummary(env), 200, origin)
 
@@ -1311,10 +1414,11 @@ async function route(request, env, ctx) {
     const createdAt = nowIso()
     const title = String(body.title || prompt.slice(0, 64) || 'Untitled generation').trim().slice(0, 100)
     const options = body.options && typeof body.options === 'object' && !Array.isArray(body.options) ? body.options : {}
+    const session = await sessionFor(env, user, model, body.sessionId, prompt)
     const statements = [env.DB.prepare(`INSERT INTO generations
-      (id, workspace_id, user_id, user_email, model_id, model_name, model_provider, title, kind, prompt, options_json, status, estimated_cost_nano_usd, cost_nano_usd, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?)`)
-      .bind(id, WORKSPACE_ID, user.id, user.email, model.id, model.name, model.provider, title, model.kind, prompt, JSON.stringify(options), estimatedCost, createdAt)]
+      (id, workspace_id, user_id, user_email, model_id, model_name, model_provider, title, kind, prompt, options_json, status, estimated_cost_nano_usd, cost_nano_usd, created_at, session_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, 0, ?, ?)`)
+      .bind(id, WORKSPACE_ID, user.id, user.email, model.id, model.name, model.provider, title, model.kind, prompt, JSON.stringify(options), estimatedCost, createdAt, session.id)]
     for (const referenceId of referenceIds) statements.push(env.DB.prepare('INSERT INTO generation_references (generation_id, upload_id) VALUES (?, ?)').bind(id, referenceId))
     try {
       await env.DB.batch(statements)
@@ -1325,10 +1429,11 @@ async function route(request, env, ctx) {
       throw error
     }
     await audit(env, user, 'generation.submitted', id, { modelId: model.id })
-    const generation = { id, userId: user.id, userEmail: user.email, title, modelId: model.id, modelName: model.name, modelProvider: model.provider, kind: model.kind, prompt, options, status: 'queued', costNanoUsd: 0, createdAt, references: [] }
+    await touchSession(env, session.id)
+    const generation = { id, userId: user.id, userEmail: user.email, title, modelId: model.id, modelName: model.name, modelProvider: model.provider, kind: model.kind, prompt, options, status: 'queued', costNanoUsd: 0, createdAt, sessionId: session.id, references: [] }
     if (referenceIds.length) await attachReferences(env, [generation])
     if (body.stream === true && model.kind === 'text' && providerKey(model.provider) === 'byteplus') {
-      return streamTextGeneration(env, ctx, { generation, model, credential, origin })
+      return streamTextGeneration(env, ctx, { generation, model, credential, origin, session })
     }
     const processing = await processGeneration(env, id)
     if (!processing.done) {

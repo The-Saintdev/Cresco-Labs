@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import { getWorkspaceData, restoreSession, type ApiBalance, type ApiGeneration, type ApiModel, type SessionUser, type UsageSummary } from '../api'
+import { archiveSession, getWorkspaceData, listSessions, renameSession, restoreSession, type ApiBalance, type ApiGeneration, type ApiModel, type ApiSession, type SessionUser, type UsageSummary } from '../api'
 
 export type Kind = 'text' | 'image' | 'video'
 export type ModelStatus = 'ready' | 'beta' | 'setup'
@@ -22,6 +22,11 @@ type WorkspaceValue = {
   loading: boolean
   refresh: (quiet?: boolean) => Promise<void>
   addGeneration: (generation: ApiGeneration) => void
+  sessions: ApiSession[]
+  refreshSessions: () => Promise<void>
+  upsertSession: (session: ApiSession) => void
+  rename: (id: string, title: string) => Promise<void>
+  archive: (id: string) => Promise<void>
   toast: (message: string) => void
   signOut: () => void
 }
@@ -59,6 +64,7 @@ export function WorkspaceProvider({
   const [generations, setGenerations] = useState<ApiGeneration[]>([])
   const [usage, setUsage] = useState<UsageSummary | null>(null)
   const [balances, setBalances] = useState<ApiBalance[]>([])
+  const [sessions, setSessions] = useState<ApiSession[]>([])
   const [loading, setLoading] = useState(true)
 
   const refresh = useCallback(async (quiet = false) => {
@@ -77,7 +83,29 @@ export function WorkspaceProvider({
     }
   }, [onToast, signOut])
 
-  useEffect(() => { void refresh() }, [refresh])
+  const refreshSessions = useCallback(async () => {
+    try {
+      setSessions((await listSessions()).sessions)
+    } catch {
+      /* the thread list is not worth interrupting the workspace for */
+    }
+  }, [])
+
+  const upsertSession = useCallback((session: ApiSession) => {
+    setSessions(items => [session, ...items.filter(item => item.id !== session.id)])
+  }, [])
+
+  const rename = useCallback(async (id: string, title: string) => {
+    const updated = (await renameSession(id, title)).session
+    setSessions(items => items.map(item => (item.id === id ? { ...item, ...updated } : item)))
+  }, [])
+
+  const archive = useCallback(async (id: string) => {
+    await archiveSession(id)
+    setSessions(items => items.filter(item => item.id !== id))
+  }, [])
+
+  useEffect(() => { void refresh(); void refreshSessions() }, [refresh, refreshSessions])
 
   // Only poll while something is actually in flight; streamed text needs no poll.
   const waiting = generations.some(item => item.status === 'queued')
@@ -92,8 +120,8 @@ export function WorkspaceProvider({
   }, [])
 
   const value = useMemo(
-    () => ({ user, setUser, models, generations, usage, balances, loading, refresh, addGeneration, toast: onToast, signOut }),
-    [user, setUser, models, generations, usage, balances, loading, refresh, addGeneration, onToast, signOut],
+    () => ({ user, setUser, models, generations, usage, balances, loading, refresh, addGeneration, sessions, refreshSessions, upsertSession, rename, archive, toast: onToast, signOut }),
+    [user, setUser, models, generations, usage, balances, loading, refresh, addGeneration, sessions, refreshSessions, upsertSession, rename, archive, onToast, signOut],
   )
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>
 }

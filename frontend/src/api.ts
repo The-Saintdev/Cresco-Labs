@@ -47,6 +47,7 @@ export type ApiGeneration = {
   error?: string | null
   providerLatencyMs?: number | null
   queuedForMs?: number | null
+  sessionId?: string | null
   completedAt?: string | null
   references?: ApiUpload[]
   createdAt: string
@@ -171,15 +172,51 @@ export async function getWorkspaceData() {
   return { models: models.models, generations: history.generations, usage }
 }
 
-export async function submitGeneration(modelId: string, prompt: string, options: Record<string, string> = {}, referenceIds: string[] = []) {
+export type ApiSession = {
+  id: string
+  modelId: string
+  title: string
+  createdAt: string
+  updatedAt: string
+  generationCount?: number
+}
+
+export async function submitGeneration(
+  modelId: string,
+  prompt: string,
+  options: Record<string, string> = {},
+  referenceIds: string[] = [],
+  sessionId?: string,
+) {
   return request<{ generation: ApiGeneration }>('/v1/generations', {
     method: 'POST',
-    body: JSON.stringify({ modelId, prompt, options, referenceIds }),
+    body: JSON.stringify({ modelId, prompt, options, referenceIds, sessionId }),
   })
 }
 
+export async function listSessions(modelId?: string) {
+  const query = modelId ? `?modelId=${encodeURIComponent(modelId)}` : ''
+  return request<{ sessions: ApiSession[] }>(`/v1/sessions${query}`)
+}
+
+export async function createSession(modelId: string, title?: string) {
+  return request<{ session: ApiSession }>('/v1/sessions', { method: 'POST', body: JSON.stringify({ modelId, title }) })
+}
+
+export async function getSession(id: string) {
+  return request<{ session: ApiSession; generations: ApiGeneration[] }>(`/v1/sessions/${encodeURIComponent(id)}`)
+}
+
+export async function renameSession(id: string, title: string) {
+  return request<{ session: ApiSession }>(`/v1/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ title }) })
+}
+
+export async function archiveSession(id: string) {
+  return request<{ archived: boolean }>(`/v1/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
 type GenerationStreamHandlers = {
-  onMeta?: (generation: ApiGeneration) => void
+  onMeta?: (generation: ApiGeneration, session: ApiSession | null) => void
   onDelta?: (text: string) => void
 }
 
@@ -192,6 +229,7 @@ export async function streamGeneration(
   referenceIds: string[] = [],
   handlers: GenerationStreamHandlers = {},
   signal?: AbortSignal,
+  sessionId?: string,
 ): Promise<ApiGeneration> {
   const token = sessionStorage.getItem('cresco_token')
   const response = await fetch(API_URL + '/v1/generations', {
@@ -202,7 +240,7 @@ export async function streamGeneration(
       accept: 'text/event-stream',
       ...(token ? { authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ modelId, prompt, options, referenceIds, stream: true }),
+    body: JSON.stringify({ modelId, prompt, options, referenceIds, sessionId, stream: true }),
   })
   if (response.status === 401) {
     clearSession()
@@ -228,7 +266,7 @@ export async function streamGeneration(
     } catch {
       return
     }
-    if (name === 'meta' && data.generation) handlers.onMeta?.(data.generation)
+    if (name === 'meta' && data.generation) handlers.onMeta?.(data.generation, data.session || null)
     else if (name === 'delta' && typeof data.text === 'string') handlers.onDelta?.(data.text)
     else if (name === 'done' && data.generation) final = data.generation
     else if (name === 'error') failure = String(data.error || 'generation_failed')

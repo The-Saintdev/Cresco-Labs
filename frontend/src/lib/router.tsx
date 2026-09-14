@@ -1,8 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 
-type RouterValue = { path: string; navigate: (to: string, options?: { replace?: boolean }) => void }
+type RouterValue = { path: string; navigate: (to: string, options?: { replace?: boolean }) => void; syncPath: () => void }
 
-const RouterContext = createContext<RouterValue>({ path: '/', navigate: () => {} })
+const RouterContext = createContext<RouterValue>({ path: '/', navigate: () => {}, syncPath: () => {} })
 
 export function RouterProvider({ children }: { children: ReactNode }) {
   const [path, setPath] = useState(() => window.location.pathname || '/')
@@ -20,7 +20,12 @@ export function RouterProvider({ children }: { children: ReactNode }) {
     window.scrollTo(0, 0)
   }, [])
 
-  const value = useMemo(() => ({ path, navigate }), [path, navigate])
+  // Adopts a URL that was already changed with replaceState. Used when a page
+  // claims a deeper URL mid-task and must not be remounted while work is in
+  // flight; calling this afterwards brings the router back in step.
+  const syncPath = useCallback(() => setPath(window.location.pathname || '/'), [])
+
+  const value = useMemo(() => ({ path, navigate, syncPath }), [path, navigate, syncPath])
   return <RouterContext.Provider value={value}>{children}</RouterContext.Provider>
 }
 

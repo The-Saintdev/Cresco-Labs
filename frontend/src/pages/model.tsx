@@ -1,174 +1,99 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowUp, ChevronDown, Download, ExternalLink, Info, Paperclip, RotateCcw, Square, X } from 'lucide-react'
-import { generationErrorMessage, streamGeneration, submitGeneration, uploadReference, type ApiGeneration, type ApiUpload } from '../api'
+import { ArrowUp, ChevronDown, Download, ExternalLink, Info, Paperclip, Pencil, RotateCcw, Square, X } from 'lucide-react'
+import {
+  generationErrorMessage, getSession, streamGeneration, submitGeneration, uploadReference,
+  type ApiGeneration, type ApiSession, type ApiUpload,
+} from '../api'
 import { Empty, GenerationStatusBadge, KindChip, Notice, kindIcon } from '../components'
 import { cx, downloadResult, formatDuration, nanoMoney, relativeTime } from '../lib/format'
-import { useWorkspace } from '../lib/store'
+import { useWorkspace, type ModelView } from '../lib/store'
 import { useRouter } from '../lib/router'
 
-type Turn = {
-  key: string
-  prompt: string
-  response: string
-  status: 'streaming' | 'complete' | 'failed'
-  error?: string
-  generationId?: string
-  latencyMs?: number | null
+export default function ModelPage({ modelId, sessionId }: { modelId?: string; sessionId?: string }) {
+  const { models, sessions, loading } = useWorkspace()
+  const thread = sessionId ? sessions.find(item => item.id === sessionId) : null
+  const resolvedId = modelId || thread?.modelId
+  const model = models.find(item => item.id === resolvedId)
+
+  // A thread opened from a deep link may not be in the cached list yet; the
+  // thread component loads it and reports the model back.
+  const [loadedModelId, setLoadedModelId] = useState<string | null>(null)
+  const fallbackModel = models.find(item => item.id === loadedModelId)
+  const active = model || fallbackModel
+
+  if (!active) {
+    if (loading || (sessionId && !loadedModelId)) {
+      return <div className="page"><Thread key={sessionId} sessionId={sessionId} model={null} onModelResolved={setLoadedModelId} /></div>
+    }
+    return <div className="page"><Empty icon={Info} title="Model not found" text="This model may have been archived, or it is not available to your account." /></div>
+  }
+  if (active.state === 'setup') {
+    return <div className="page"><Empty icon={Info} title={`${active.name} is not ready`} text="An administrator still needs to add a provider key or endpoint for this model." /></div>
+  }
+  return <Thread key={sessionId || `new-${active.id}`} sessionId={sessionId} model={active} onModelResolved={setLoadedModelId} />
 }
 
-export default function ModelPage({ modelId }: { modelId: string }) {
-  const { models, loading } = useWorkspace()
-  const model = models.find(item => item.id === modelId)
+type Pending = { key: string; prompt: string; response: string; error?: string }
 
-  if (!model) {
-    if (loading) return <div className="page" />
-    return <div className="page"><Empty icon={Info} title="Model not found" text="This model may have been archived or is not available to your account." /></div>
-  }
-  if (model.state === 'setup') {
-    return <div className="page"><Empty icon={Info} title={`${model.name} is not ready`} text="An administrator still needs to add a provider key or endpoint for this model." /></div>
-  }
-  return model.kind === 'text' ? <TextModel key={model.id} model={model} /> : <MediaModel key={model.id} model={model} />
-}
+function Thread({ sessionId, model, onModelResolved }: { sessionId?: string; model: ModelView | null; onModelResolved: (id: string) => void }) {
+  const { addGeneration, refresh, upsertSession, generations, toast } = useWorkspace()
+  const { syncPath } = useRouter()
 
-/* --- text: a conversation surface ----------------------------------------- */
-
-function TextModel({ model }: { model: ReturnType<typeof useWorkspace>['models'][number] }) {
-  const { addGeneration, refresh } = useWorkspace()
-  const [turns, setTurns] = useState<Turn[]>([])
+  const [history, setHistory] = useState<ApiGeneration[]>([])
+  const [pending, setPending] = useState<Pending | null>(null)
   const [prompt, setPrompt] = useState('')
   const [busy, setBusy] = useState(false)
-  const abort = useRef<AbortController | null>(null)
-  const bottom = useRef<HTMLDivElement>(null)
-  const box = useRef<HTMLTextAreaElement>(null)
+  const [error, setError] = useState('')
+  const [preview, setPreview] = useState<ApiGeneration | null>(null)
 
-  useEffect(() => { bottom.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }) }, [turns])
+  const [aspect, setAspect] = useState('16:9')
+  const [quality, setQuality] = useState('Standard')
+  const [duration, setDuration] = useState('10 seconds')
+  const [references, setReferences] = useState<ApiUpload[]>([])
+  const [uploading, setUploading] = useState(false)
+
+  const abort = useRef<AbortController | null>(null)
+  const box = useRef<HTMLTextAreaElement>(null)
+  const bottom = useRef<HTMLDivElement>(null)
+  const pendingRef = useRef<Pending | null>(null)
+  pendingRef.current = pending
+
+  const kind = model?.kind || 'text'
+
+  useEffect(() => {
+    if (!sessionId) return
+    let alive = true
+    void getSession(sessionId)
+      .then(data => {
+        if (!alive) return
+        setHistory(data.generations)
+        upsertSession(data.session)
+        onModelResolved(data.session.modelId)
+      })
+      .catch(() => { if (alive) setError('This thread could not be loaded.') })
+    return () => { alive = false }
+  }, [sessionId, upsertSession, onModelResolved])
+
+  // Media jobs finish server-side; the workspace poll carries the update here.
+  useEffect(() => {
+    if (!sessionId || kind === 'text') return
+    setHistory(items => items.map(item => generations.find(entry => entry.id === item.id) || item))
+  }, [generations, sessionId, kind])
+
+  useEffect(() => { bottom.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }) }, [history.length, pending?.response])
 
   const grow = useCallback(() => {
     const element = box.current
     if (!element) return
     element.style.height = 'auto'
-    element.style.height = `${Math.min(element.scrollHeight, 260)}px`
+    element.style.height = `${Math.min(element.scrollHeight, 240)}px`
   }, [])
   useEffect(grow, [prompt, grow])
 
-  const send = async (text: string) => {
-    const value = text.trim()
-    if (!value || busy) return
-    const key = `turn-${Date.now()}`
-    setTurns(items => [...items, { key, prompt: value, response: '', status: 'streaming' }])
-    setPrompt('')
-    setBusy(true)
-    const controller = new AbortController()
-    abort.current = controller
-    const update = (patch: Partial<Turn>) => setTurns(items => items.map(item => (item.key === key ? { ...item, ...patch } : item)))
-    try {
-      const final = await streamGeneration(model.id, value, {}, [], {
-        onDelta: chunk => update({ response: (turnResponse(key) ?? '') + chunk }),
-      }, controller.signal)
-      update({ status: 'complete', response: final.outputText || '', generationId: final.id, latencyMs: final.providerLatencyMs })
-      addGeneration(final)
-      void refresh(true)
-    } catch (reason) {
-      if (controller.signal.aborted) update({ status: 'complete' })
-      else update({ status: 'failed', error: reason instanceof Error ? reason.message : 'The request could not be sent.' })
-    } finally {
-      abort.current = null
-      setBusy(false)
-      box.current?.focus()
-    }
-  }
-
-  // Reading the live value avoids a stale closure while deltas arrive fast.
-  const turnsRef = useRef<Turn[]>([])
-  turnsRef.current = turns
-  function turnResponse(key: string) {
-    return turnsRef.current.find(item => item.key === key)?.response
-  }
-
-  const stop = () => abort.current?.abort()
-
-  return <div className="chat">
-    <div className="chat-scroll">
-      <div className="chat-inner">
-        {!turns.length && <div className="chat-empty">
-          <KindChip kind="text" size={38} />
-          <h2>{model.name}</h2>
-          <p>{model.blurb}</p>
-          <div className="chat-suggestions">
-            {['Summarise this in five bullets', 'Draft a short announcement', 'Explain this like I am new to it'].map(suggestion => (
-              <button key={suggestion} onClick={() => { setPrompt(suggestion); box.current?.focus() }}>{suggestion}</button>
-            ))}
-          </div>
-        </div>}
-
-        {turns.map(turn => <div className="turn" key={turn.key}>
-          <div className="turn user"><div className="bubble-user">{turn.prompt}</div></div>
-          <div className="turn">
-            <div className="turn-head">
-              <KindChip kind="text" size={20} />
-              <strong>{model.name}</strong>
-              {turn.status === 'streaming' && <span className="spinner" />}
-              <span className="spacer" />
-              {turn.latencyMs ? <span>{formatDuration(turn.latencyMs)}</span> : null}
-            </div>
-            {turn.status === 'failed'
-              ? <div className="turn-error"><X size={15} /><div><strong>Request failed</strong>{generationErrorMessage(turn.error || '')}</div></div>
-              : <div className={cx('response', turn.status === 'streaming' && 'streaming')}>{turn.response}</div>}
-            {turn.status !== 'streaming' && <div className="turn-actions">
-              <button className="btn btn-ghost btn-sm" onClick={() => void send(turn.prompt)}><RotateCcw size={13} /> Retry</button>
-              {turn.response && <button className="btn btn-ghost btn-sm" onClick={() => void navigator.clipboard?.writeText(turn.response)}>Copy</button>}
-            </div>}
-          </div>
-        </div>)}
-        <div ref={bottom} />
-      </div>
-    </div>
-
-    <div className="composer-wrap">
-      <div className="composer">
-        <textarea
-          ref={box}
-          rows={1}
-          value={prompt}
-          placeholder={`Message ${model.name}…`}
-          onChange={event => setPrompt(event.target.value)}
-          onKeyDown={event => {
-            if (event.key === 'Enter' && !event.shiftKey) {
-              event.preventDefault()
-              void send(prompt)
-            }
-          }}
-        />
-        <div className="composer-foot">
-          <span className="composer-hint"><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</span>
-          <span className="spacer" />
-          {busy
-            ? <button className="btn btn-secondary btn-sm" onClick={stop}><Square size={12} /> Stop</button>
-            : <button className="btn btn-primary btn-icon" disabled={!prompt.trim()} onClick={() => void send(prompt)} aria-label="Send"><ArrowUp size={16} /></button>}
-        </div>
-      </div>
-      <p className="composer-hint" style={{ maxWidth: 'var(--measure)', margin: '8px auto 0', textAlign: 'center' }}>
-        Each message is sent to {model.provider} on its own. Earlier turns are not included as context.
-      </p>
-    </div>
-  </div>
-}
-
-/* --- image and video ------------------------------------------------------ */
-
-function MediaModel({ model }: { model: ReturnType<typeof useWorkspace>['models'][number] }) {
-  const { generations, addGeneration, refresh, toast } = useWorkspace()
-  const { navigate } = useRouter()
-  const [prompt, setPrompt] = useState('')
-  const [aspect, setAspect] = useState('16:9')
-  const [quality, setQuality] = useState(model.kind === 'video' ? '720p' : 'Standard')
-  const [duration, setDuration] = useState('10 seconds')
-  const [references, setReferences] = useState<ApiUpload[]>([])
-  const [uploading, setUploading] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-
-  const mine = useMemo(() => generations.filter(item => item.modelId === model.id).slice(0, 24), [generations, model.id])
+  useEffect(() => {
+    if (kind === 'image') setQuality('Standard')
+    if (kind === 'video') setQuality('720p')
+  }, [kind])
 
   const addFiles = async (files: FileList | null) => {
     if (!files?.length) return
@@ -185,16 +110,61 @@ function MediaModel({ model }: { model: ReturnType<typeof useWorkspace>['models'
     }
   }
 
-  const generate = async () => {
-    if (!prompt.trim() || busy) return
-    setBusy(true); setError('')
+  const send = async (text: string) => {
+    const value = text.trim()
+    if (!value || !model || busy) return
+    setError('')
+    setBusy(true)
+
+    if (kind === 'text') {
+      const key = `pending-${Date.now()}`
+      setPending({ key, prompt: value, response: '' })
+      setPrompt('')
+      const controller = new AbortController()
+      abort.current = controller
+      try {
+        const final = await streamGeneration(model.id, value, {}, [], {
+          onMeta: (_generation, session) => {
+            if (!session) return
+            upsertSession(session)
+            // Claim the thread URL without a router update: a re-render here would
+            // unmount this component and orphan the stream still being read.
+            if (!sessionId) window.history.replaceState({}, '', `/c/${session.id}`)
+          },
+          onDelta: chunk => setPending(current => (current && current.key === key ? { ...current, response: current.response + chunk } : current)),
+        }, controller.signal, sessionId)
+        setHistory(items => [...items, final])
+        setPending(null)
+        addGeneration(final)
+        void refresh(true)
+      } catch (reason) {
+        if (controller.signal.aborted) {
+          const partial = pendingRef.current
+          if (partial?.response) setHistory(items => [...items, syntheticGeneration(partial, model)])
+          setPending(null)
+        } else {
+          setPending(current => (current && current.key === key ? { ...current, error: reason instanceof Error ? reason.message : 'generation_failed' } : current))
+        }
+      } finally {
+        abort.current = null
+        setBusy(false)
+        box.current?.focus()
+        if (!sessionId) syncPath()
+      }
+      return
+    }
+
     try {
-      const options: Record<string, string> = model.kind === 'video' ? { aspect, quality, duration } : { aspect, quality }
-      const created = (await submitGeneration(model.id, prompt.trim(), options, references.map(item => item.id))).generation
+      const options: Record<string, string> = kind === 'video' ? { aspect, quality, duration } : { aspect, quality }
+      const created = (await submitGeneration(model.id, value, options, references.map(item => item.id), sessionId)).generation
+      setHistory(items => [...items, created])
       addGeneration(created)
       setPrompt(''); setReferences([])
-      toast(created.status === 'complete' ? 'Result ready' : 'Sent to the provider')
       void refresh(true)
+      if (!sessionId && created.sessionId) {
+        window.history.replaceState({}, '', `/c/${created.sessionId}`)
+        syncPath()
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'The request could not be sent.')
     } finally {
@@ -202,81 +172,207 @@ function MediaModel({ model }: { model: ReturnType<typeof useWorkspace>['models'
     }
   }
 
-  return <div className="chat">
-    <div className="chat-scroll">
-      <div className="page" style={{ paddingTop: 22 }}>
-        <div className="page-head">
-          <KindChip kind={model.kind} size={34} />
-          <div>
-            <h1>{model.name}</h1>
-            <p>{model.provider} · {model.priceNanoUsd ? `${nanoMoney(model.priceNanoUsd)} per run` : 'cost tracked per run'}</p>
+  // Feeding a finished result back in as a reference is how an existing image or
+  // video gets edited: the provider receives it alongside the new prompt.
+  const editFrom = async (generation: ApiGeneration) => {
+    if (!generation.resultUrl) return
+    setPreview(null)
+    setError('')
+    setUploading(true)
+    try {
+      const response = await fetch(generation.resultUrl)
+      if (!response.ok) throw new Error('fetch_failed')
+      const blob = await response.blob()
+      const extension = generation.kind === 'video' ? 'mp4' : 'png'
+      const file = new File([blob], `cresco-${generation.id}.${extension}`, { type: blob.type || (generation.kind === 'video' ? 'video/mp4' : 'image/png') })
+      const uploaded = await uploadReference(file)
+      setReferences(items => [...items.filter(item => item.id !== uploaded.upload.id), uploaded.upload].slice(0, 5))
+      setPrompt(current => current || 'Edit this: ')
+      toast('Added as a reference')
+      box.current?.focus()
+    } catch {
+      setError('That result could not be reused. Some providers block direct downloads; download it and attach it manually.')
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const stop = () => abort.current?.abort()
+  const empty = !history.length && !pending
+
+  return <div className={cx('chat', kind !== 'text' && preview && 'with-preview')}>
+    <div className="thread-body">
+      <div className="chat-scroll">
+        <div className="chat-inner">
+          {empty && model && <div className="chat-empty">
+            <KindChip kind={kind} size={38} />
+            <h2>{model.name}</h2>
+            <p>{model.blurb}</p>
+            {kind === 'text' && <div className="chat-suggestions">
+              {['Summarise this in five bullets', 'Draft a short announcement', 'Explain this like I am new to it'].map(suggestion => (
+                <button key={suggestion} onClick={() => { setPrompt(suggestion); box.current?.focus() }}>{suggestion}</button>
+              ))}
+            </div>}
+          </div>}
+
+          {history.map(item => <ThreadTurn
+            key={item.id}
+            generation={item}
+            modelName={model?.name || item.modelName || ''}
+            onRetry={() => void send(item.prompt)}
+            onPreview={() => setPreview(item)}
+            onEdit={() => void editFrom(item)}
+          />)}
+
+          {pending && <div className="turn" key={pending.key}>
+            <div className="turn user"><div className="bubble-user">{pending.prompt}</div></div>
+            <div className="turn">
+              <div className="turn-head">
+                <KindChip kind="text" size={20} />
+                <strong>{model?.name}</strong>
+                {!pending.error && <span className="spinner" />}
+              </div>
+              {pending.error
+                ? <div className="turn-error"><X size={15} /><div><strong>Request failed</strong>{generationErrorMessage(pending.error)}</div></div>
+                : <div className="response streaming">{pending.response}</div>}
+            </div>
+          </div>}
+          <div ref={bottom} />
+        </div>
+      </div>
+
+      <div className="composer-wrap">
+        {error && <div style={{ maxWidth: 'var(--measure)', margin: '0 auto 10px' }}><Notice tone="error">{error}</Notice></div>}
+        <div className="composer">
+          <textarea
+            ref={box}
+            rows={1}
+            value={prompt}
+            placeholder={kind === 'text' ? `Message ${model?.name || 'the model'}…` : kind === 'video' ? 'Describe the scene, action, camera and mood…' : 'Describe the subject, composition, light and style…'}
+            onChange={event => setPrompt(event.target.value)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault()
+                void send(prompt)
+              }
+            }}
+          />
+
+          {kind !== 'text' && <div className="option-row">
+            <Pill value={aspect} onChange={setAspect} options={['16:9', '9:16', '1:1', '4:3']} />
+            <Pill value={quality} onChange={setQuality} options={kind === 'video' ? ['480p', '720p', '1080p'] : ['Standard', 'High']} />
+            {kind === 'video' && <Pill value={duration} onChange={setDuration} options={['5 seconds', '10 seconds', '15 seconds']} />}
+          </div>}
+
+          {references.length > 0 && <div className="attachments">
+            {references.map(reference => <div className="attachment" key={reference.id}>
+              <span>{reference.fileName}</span>
+              <button onClick={() => setReferences(items => items.filter(item => item.id !== reference.id))} aria-label={`Remove ${reference.fileName}`}><X size={12} /></button>
+            </div>)}
+          </div>}
+
+          <div className="composer-foot">
+            {kind !== 'text' && <>
+              <label className="btn btn-ghost btn-sm" style={{ cursor: uploading ? 'wait' : 'pointer' }}>
+                <Paperclip size={13} /> {uploading ? 'Uploading…' : 'Reference'}
+                <input type="file" multiple hidden accept={kind === 'video' ? 'image/*,video/*,audio/*' : 'image/*'} disabled={uploading || references.length >= 5} onChange={event => { void addFiles(event.target.files); event.target.value = '' }} />
+              </label>
+              <span className="composer-hint">{references.length}/5</span>
+            </>}
+            {kind === 'text' && <span className="composer-hint"><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line</span>}
+            <span className="spacer" />
+            {busy && kind === 'text'
+              ? <button className="btn btn-secondary btn-sm" onClick={stop}><Square size={12} /> Stop</button>
+              : kind === 'text'
+                ? <button className="btn btn-primary btn-icon" disabled={!prompt.trim()} onClick={() => void send(prompt)} aria-label="Send"><ArrowUp size={16} /></button>
+                : <button className="btn btn-primary btn-sm" disabled={!prompt.trim() || busy || uploading} onClick={() => void send(prompt)}>{busy ? 'Sending…' : 'Generate'}</button>}
           </div>
         </div>
-        {mine.length ? <div className="media-grid">
-          {mine.map(item => <MediaResult key={item.id} generation={item} onOpen={() => navigate(`/g/${item.id}`)} />)}
-        </div> : <Empty icon={kindIcon[model.kind]} title={`No ${model.kind === 'image' ? 'images' : 'videos'} yet`} text={`Describe what you want and ${model.name} will generate it below.`} />}
+        {kind === 'text' && <p className="composer-hint thread-note">
+          Each message is sent to {model?.provider} on its own. Earlier turns in this thread are not included as context.
+        </p>}
       </div>
     </div>
 
-    <div className="composer-wrap">
-      <div className="composer">
-        <textarea
-          rows={2}
-          value={prompt}
-          placeholder={model.kind === 'video' ? 'Describe the scene, action, camera and mood…' : 'Describe the subject, composition, light and style…'}
-          onChange={event => setPrompt(event.target.value)}
-        />
-        <div className="option-row">
-          <Pill value={aspect} onChange={setAspect} options={['16:9', '9:16', '1:1', '4:3']} />
-          <Pill value={quality} onChange={setQuality} options={model.kind === 'video' ? ['480p', '720p', '1080p'] : ['Standard', 'High']} />
-          {model.kind === 'video' && <Pill value={duration} onChange={setDuration} options={['5 seconds', '10 seconds', '15 seconds']} />}
-        </div>
-        {references.length > 0 && <div className="attachments">
-          {references.map(reference => <div className="attachment" key={reference.id}>
-            <span>{reference.fileName}</span>
-            <button onClick={() => setReferences(items => items.filter(item => item.id !== reference.id))} aria-label={`Remove ${reference.fileName}`}><X size={12} /></button>
-          </div>)}
-        </div>}
-        <div className="composer-foot">
-          <label className="btn btn-ghost btn-sm" style={{ cursor: uploading ? 'wait' : 'pointer' }}>
-            <Paperclip size={13} /> {uploading ? 'Uploading…' : 'Reference'}
-            <input type="file" multiple hidden accept={model.kind === 'video' ? 'image/*,video/*,audio/*' : 'image/*'} disabled={uploading || references.length >= 5} onChange={event => { void addFiles(event.target.files); event.target.value = '' }} />
-          </label>
-          <span className="composer-hint">{references.length}/5</span>
-          <span className="spacer" />
-          <button className="btn btn-primary btn-sm" disabled={!prompt.trim() || busy || uploading} onClick={() => void generate()}>
-            {busy ? 'Sending…' : 'Generate'}
-          </button>
-        </div>
-      </div>
-      {error && <div style={{ maxWidth: 'var(--measure)', margin: '10px auto 0' }}><Notice tone="error">{error}</Notice></div>}
-    </div>
+    {preview && <PreviewPane generation={preview} onClose={() => setPreview(null)} onEdit={() => void editFrom(preview)} />}
   </div>
 }
 
-function MediaResult({ generation, onOpen }: { generation: ApiGeneration; onOpen: () => void }) {
-  const waiting = generation.status === 'queued'
-  return <div className="media-card">
-    <button className="media-frame" onClick={onOpen} style={{ width: '100%' }}>
-      {generation.resultUrl && generation.kind === 'image' && <img src={generation.resultUrl} alt={generation.title} loading="lazy" />}
-      {generation.resultUrl && generation.kind === 'video' && <video src={generation.resultUrl} controls playsInline />}
-      {!generation.resultUrl && <div className="media-pending">
-        {waiting ? <><span className="spinner" />Working{generation.queuedForMs ? ` · ${formatDuration(generation.queuedForMs)}` : ''}</> : <>No result</>}
-      </div>}
-    </button>
-    <div className="media-body">
-      <p>{generation.prompt}</p>
-      <div className="media-actions">
-        <GenerationStatusBadge status={generation.status} />
+function ThreadTurn({ generation, modelName, onRetry, onPreview, onEdit }: {
+  generation: ApiGeneration
+  modelName: string
+  onRetry: () => void
+  onPreview: () => void
+  onEdit: () => void
+}) {
+  const Icon = kindIcon[generation.kind]
+  return <div className="turn">
+    <div className="turn user"><div className="bubble-user">{generation.prompt}</div></div>
+    <div className="turn">
+      <div className="turn-head">
+        <KindChip kind={generation.kind} size={20} />
+        <strong>{modelName}</strong>
+        {generation.status === 'queued' && <span className="spinner" />}
         <span className="spacer" />
-        <span className="row-meta">{relativeTime(generation.createdAt)}</span>
+        {generation.status === 'queued' && generation.queuedForMs ? <span>waiting {formatDuration(generation.queuedForMs)}</span> : null}
+        {generation.providerLatencyMs ? <span>{formatDuration(generation.providerLatencyMs)}</span> : null}
+      </div>
+
+      {generation.status === 'failed' && <div className="turn-error">
+        <X size={15} /><div><strong>Request failed</strong>{generationErrorMessage(generation.error || '')}</div>
+      </div>}
+
+      {generation.outputText && <div className="response">{generation.outputText}</div>}
+
+      {generation.kind !== 'text' && generation.status !== 'failed' && <div className="thread-media">
+        <button className="media-frame thread-frame" onClick={onPreview} disabled={!generation.resultUrl}>
+          {generation.resultUrl
+            ? generation.kind === 'image'
+              ? <img src={generation.resultUrl} alt={generation.title} loading="lazy" />
+              : <video src={generation.resultUrl} />
+            : <div className="media-pending"><span className="spinner" /><Icon size={15} /> Working…</div>}
+        </button>
+      </div>}
+
+      <div className="turn-actions">
+        <button className="btn btn-ghost btn-sm" onClick={onRetry}><RotateCcw size={13} /> Retry</button>
+        {generation.outputText && <button className="btn btn-ghost btn-sm" onClick={() => void navigator.clipboard?.writeText(generation.outputText!)}>Copy</button>}
         {generation.resultUrl && <>
-          <button className="btn btn-icon" title="Download" onClick={() => void downloadResult(generation.resultUrl!, generation.id, generation.kind)}><Download size={14} /></button>
-          <a className="btn btn-icon" title="Open original" href={generation.resultUrl} target="_blank" rel="noreferrer"><ExternalLink size={14} /></a>
+          <button className="btn btn-ghost btn-sm" onClick={onEdit}><Pencil size={13} /> Use as reference</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => void downloadResult(generation.resultUrl!, generation.id, generation.kind)}><Download size={13} /> Download</button>
         </>}
       </div>
     </div>
   </div>
+}
+
+function PreviewPane({ generation, onClose, onEdit }: { generation: ApiGeneration; onClose: () => void; onEdit: () => void }) {
+  return <aside className="preview-pane">
+    <div className="preview-head">
+      <strong>Preview</strong>
+      <span className="spacer" />
+      <GenerationStatusBadge status={generation.status} />
+      <button className="btn btn-icon" onClick={onClose} aria-label="Close preview"><X size={15} /></button>
+    </div>
+    <div className="preview-stage">
+      {generation.kind === 'image'
+        ? <img src={generation.resultUrl!} alt={generation.title} />
+        : <video src={generation.resultUrl!} controls playsInline />}
+    </div>
+    <div className="preview-body">
+      <p>{generation.prompt}</p>
+      <dl className="preview-meta">
+        <div><dt>Cost</dt><dd>{nanoMoney(generation.costNanoUsd)}</dd></div>
+        <div><dt>Provider time</dt><dd>{formatDuration(generation.providerLatencyMs) || '—'}</dd></div>
+        <div><dt>Created</dt><dd>{relativeTime(generation.createdAt)}</dd></div>
+      </dl>
+    </div>
+    <div className="preview-foot">
+      <button className="btn btn-secondary btn-sm" onClick={onEdit}><Pencil size={13} /> Use as reference</button>
+      <button className="btn btn-ghost btn-sm" onClick={() => void downloadResult(generation.resultUrl!, generation.id, generation.kind)}><Download size={13} /> Download</button>
+      <a className="btn btn-ghost btn-sm" href={generation.resultUrl!} target="_blank" rel="noreferrer"><ExternalLink size={13} /> Open</a>
+    </div>
+  </aside>
 }
 
 function Pill({ value, options, onChange }: { value: string; options: string[]; onChange: (value: string) => void }) {
@@ -287,3 +383,22 @@ function Pill({ value, options, onChange }: { value: string; options: string[]; 
     <ChevronDown size={12} />
   </label>
 }
+
+// A stopped stream still produced text; keep it visible without inventing a record.
+function syntheticGeneration(partial: Pending, model: ModelView): ApiGeneration {
+  return {
+    id: `stopped-${partial.key}`,
+    userEmail: '',
+    title: partial.prompt.slice(0, 64),
+    modelId: model.id,
+    modelName: model.name,
+    kind: 'text',
+    prompt: partial.prompt,
+    status: 'complete',
+    costNanoUsd: 0,
+    outputText: partial.response,
+    createdAt: new Date().toISOString(),
+  } as ApiGeneration
+}
+
+export type { ApiSession }
