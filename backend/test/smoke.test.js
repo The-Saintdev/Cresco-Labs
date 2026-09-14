@@ -221,6 +221,30 @@ test('login, authorization, and usage summary', async () => {
     assert.equal(threadDetail.generations[0].prompt, 'Test direct BytePlus text output.')
     assert.equal(threadDetail.generations[1].prompt, 'A follow up in the same thread.')
 
+    // The follow-up above was sent into an existing thread, so the provider should
+    // have received the earlier exchange ahead of it.
+    const contextBody = bytePlusTextBodies.at(-1)
+    assert.deepEqual(contextBody.messages, [
+      { role: 'user', content: 'Test direct BytePlus text output.' },
+      { role: 'assistant', content: 'BytePlus chat response' },
+      { role: 'user', content: 'A follow up in the same thread.' },
+    ])
+
+    await fetch(baseUrl + '/v1/admin/models/' + bytePlusTextModel.model.id, {
+      method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ contextTurns: 0 }),
+    })
+    await fetch(baseUrl + '/v1/generations', {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ modelId: bytePlusTextModel.model.id, prompt: 'No context please.', sessionId: glmThread.id }),
+    })
+    assert.deepEqual(bytePlusTextBodies.at(-1).messages, [{ role: 'user', content: 'No context please.' }],
+      'contextTurns 0 sends the prompt alone')
+
+    const rejectedTurns = await fetch(baseUrl + '/v1/admin/models/' + bytePlusTextModel.model.id, {
+      method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ contextTurns: 999 }),
+    })
+    assert.equal(rejectedTurns.status, 400)
+
     const renamed = await fetch(baseUrl + '/v1/sessions/' + glmThread.id, {
       method: 'PATCH', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Timeout debugging' }),
     })

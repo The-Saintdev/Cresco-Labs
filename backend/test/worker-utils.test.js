@@ -89,7 +89,7 @@ test('worker honours per-model reasoning and endpoint settings', () => {
   const responsesModel = { endpoint: 'glm-5.3-flash', textApi: 'responses', thinkingMode: 'enabled' }
   assert.equal(__test.textRequestPath(responsesModel), '/responses')
   const body = __test.textRequestBody(responsesModel, 'Say hello')
-  assert.equal(body.input, 'Say hello')
+  assert.deepEqual(body.input, [{ role: 'user', content: 'Say hello' }])
   assert.deepEqual(body.thinking, { type: 'enabled' })
   assert.equal(__test.textRequestBody({ endpoint: 'x', thinkingMode: 'auto' }, 'hi').thinking, undefined)
 })
@@ -119,4 +119,37 @@ test('worker caps how long a generation may stay queued', () => {
   assert.equal(__test.maxQueuedMs({}, 'video'), 3600000)
   assert.equal(__test.maxQueuedMs({ CRESCO_MAX_QUEUED_MINUTES: '5' }, 'video'), 300000)
   assert.equal(__test.maxQueuedMs({}, 'unknown-kind'), 1800000)
+})
+
+test('worker carries thread history into the request body', () => {
+  const model = { endpoint: 'glm-5.3-flash', contextTurns: 8 }
+  const history = [
+    { role: 'user', content: 'First question' },
+    { role: 'assistant', content: 'First answer' },
+  ]
+  const body = __test.textRequestBody(model, 'Follow up', { history })
+  assert.deepEqual(body.messages, [...history, { role: 'user', content: 'Follow up' }])
+
+  const responsesBody = __test.textRequestBody({ ...model, textApi: 'responses' }, 'Follow up', { history })
+  assert.equal(responsesBody.input.length, 3)
+  assert.equal(responsesBody.input[2].content, 'Follow up')
+})
+
+test('worker bounds how much thread history is resent', () => {
+  assert.equal(__test.contextTurns({ contextTurns: 8 }), 8)
+  assert.equal(__test.contextTurns({ contextTurns: 0 }), 0)
+  assert.equal(__test.contextTurns({}), 0)
+  assert.equal(__test.contextTurns({ contextTurns: -3 }), 0)
+  assert.equal(__test.contextTurns({ contextTurns: 500 }), 50)
+
+  // The newest messages survive when the character budget is exceeded.
+  const long = Array.from({ length: 6 }, (_value, index) => ({ role: 'user', content: 'x'.repeat(5000) + String(index) }))
+  const trimmed = __test.trimContext(long)
+  assert.ok(trimmed.length < long.length)
+  assert.equal(trimmed.at(-1), long.at(-1))
+  assert.ok(trimmed.reduce((sum, message) => sum + message.content.length, 0) <= 24000)
+
+  // A single oversized message is never dropped to nothing.
+  const huge = [{ role: 'user', content: 'y'.repeat(40000) }]
+  assert.equal(__test.trimContext(huge).length, 1)
 })

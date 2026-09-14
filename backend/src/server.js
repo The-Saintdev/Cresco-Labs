@@ -198,6 +198,7 @@ function storeCredential(provider, apiKey) {
 }
 
 function safeModel(model) {
+  if (model.contextTurns === undefined) model.contextTurns = 8
   const credentialConfigured = Boolean(credentialFor(model.provider))
   const adapterConfigured = ['fal.ai', 'byteplus'].includes(providerKey(model.provider))
   return { ...model, credentialConfigured, adapterConfigured, executionReady: Boolean(credentialConfigured && adapterConfigured && model.endpoint && model.status !== 'disabled') }
@@ -377,18 +378,61 @@ function textRequestPath(model) {
   return textApi(model) === 'responses' ? '/responses' : '/chat/completions'
 }
 
+const MAX_CONTEXT_TURNS = 50
+// Every carried turn is re-sent and re-billed on each message, so the history is
+// capped by turn count and by total characters.
+const MAX_CONTEXT_CHARS = 24000
+
+function contextTurns(model) {
+  const value = Number(model?.contextTurns)
+  if (!Number.isFinite(value) || value < 0) return 0
+  return Math.min(Math.floor(value), MAX_CONTEXT_TURNS)
+}
+
+// Oldest first, trimmed from the front once the character budget is spent, so the
+// most recent exchanges always survive.
+function trimContext(messages) {
+  let total = messages.reduce((sum, message) => sum + message.content.length, 0)
+  let start = 0
+  while (total > MAX_CONTEXT_CHARS && start < messages.length - 1) {
+    total -= messages[start].content.length
+    start += 1
+  }
+  return messages.slice(start)
+}
+
+// Earlier turns of the same thread, as alternating user/assistant messages. Only
+// completed turns that actually produced text are carried.
+function threadContext(generation, model) {
+  const turns = contextTurns(model)
+  if (!turns || model.kind !== 'text' || !generation.sessionId) return []
+  const earlier = db.generations
+    .filter(item => item.sessionId === generation.sessionId && item.id !== generation.id && item.status === 'complete')
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+    .slice(-turns)
+  const messages = []
+  for (const item of earlier) {
+    const answer = providerOutputText(item.result)
+    if (!item.prompt || !answer) continue
+    messages.push({ role: 'user', content: String(item.prompt) })
+    messages.push({ role: 'assistant', content: String(answer) })
+  }
+  return messages
+}
+
 // 'auto' leaves the decision to the provider default; anything else is explicit,
 // and 'disabled' is the default because a reasoning pass is the main reason a
 // flash-class model takes longer than the request timeout.
-function textRequestBody(model, prompt, { stream = false } = {}) {
+function textRequestBody(model, prompt, { stream = false, history = [] } = {}) {
   const mode = thinkingMode(model)
   const thinking = mode === 'auto' ? {} : { thinking: { type: mode } }
+  const messages = trimContext([...history, { role: 'user', content: prompt }])
   if (textApi(model) === 'responses') {
-    return { model: model.endpoint, input: prompt, ...thinking, ...(stream ? { stream: true } : {}) }
+    return { model: model.endpoint, input: messages, ...thinking, ...(stream ? { stream: true } : {}) }
   }
   return {
     model: model.endpoint,
-    messages: [{ role: 'user', content: prompt }],
+    messages,
     ...thinking,
     ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}),
   }
@@ -554,7 +598,8 @@ async function dispatchBytePlusGeneration(generation, model, credential) {
   const timeoutMs = providerTimeoutMs(model.kind)
   if (model.kind === 'text') {
     const result = await bytePlusRequest(base + textRequestPath(model), credential, {
-      method: 'POST', kind: model.kind, timeoutMs, body: JSON.stringify(textRequestBody(model, generation.prompt)),
+      method: 'POST', kind: model.kind, timeoutMs,
+      body: JSON.stringify(textRequestBody(model, generation.prompt, { history: threadContext(generation, model) })),
     })
     return { asynchronous: false, result, requestId: result.id || null }
   }
@@ -727,7 +772,7 @@ function streamTextDelta(payload) {
   return ''
 }
 
-async function* bytePlusTextStream(prompt, model, credential) {
+async function* bytePlusTextStream(prompt, model, credential, history = []) {
   const url = bytePlusBaseUrl.replace(/\/$/, '') + textRequestPath(model)
   const timeoutMs = providerTimeoutMs('text', true)
   const startedAt = Date.now()
@@ -740,7 +785,7 @@ async function* bytePlusTextStream(prompt, model, credential) {
         'content-type': 'application/json',
         accept: 'text/event-stream',
       },
-      body: JSON.stringify(textRequestBody(model, prompt, { stream: true })),
+      body: JSON.stringify(textRequestBody(model, prompt, { stream: true, history })),
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (error) {
@@ -811,7 +856,7 @@ async function streamTextGeneration(response, origin, generation, model, credent
     response.write(sseFrame('meta', { generation: safeGeneration(generation), session: safeSession(session) }))
     generation.providerState = 'streaming'
     generation.dispatchedAt = new Date().toISOString()
-    for await (const chunk of bytePlusTextStream(generation.prompt, model, credential)) {
+    for await (const chunk of bytePlusTextStream(generation.prompt, model, credential, threadContext(generation, model))) {
       if (chunk.requestId) requestId = chunk.requestId
       if (chunk.usage) usage = chunk.usage
       if (!chunk.delta) continue
@@ -1194,7 +1239,10 @@ const server = createServer(async (request, response) => {
       if (priceNanoUsd === null) return send(response, 400, { error: 'invalid_model_price' }, origin)
       if (body.thinkingMode !== undefined && !THINKING_MODES.includes(body.thinkingMode)) return send(response, 400, { error: 'invalid_thinking_mode' }, origin)
       if (body.textApi !== undefined && !TEXT_APIS.includes(body.textApi)) return send(response, 400, { error: 'invalid_text_api' }, origin)
-      const created = { id: randomUUID(), name: String(body.name).trim(), description: String(body.description || '').trim().slice(0, 500), provider: String(body.provider).trim(), kind: body.kind, endpoint: String(body.endpoint || '').trim() || null, status: hasCredential ? (body.status === 'beta' ? 'beta' : 'active') : 'disabled', priceNanoUsd, thinkingMode: body.thinkingMode || 'disabled', textApi: body.textApi || 'chat_completions', createdAt: new Date().toISOString() }
+      if (body.contextTurns !== undefined && (!Number.isFinite(Number(body.contextTurns)) || Number(body.contextTurns) < 0 || Number(body.contextTurns) > MAX_CONTEXT_TURNS)) {
+        return send(response, 400, { error: 'invalid_context_turns' }, origin)
+      }
+      const created = { id: randomUUID(), name: String(body.name).trim(), description: String(body.description || '').trim().slice(0, 500), provider: String(body.provider).trim(), kind: body.kind, endpoint: String(body.endpoint || '').trim() || null, status: hasCredential ? (body.status === 'beta' ? 'beta' : 'active') : 'disabled', priceNanoUsd, thinkingMode: body.thinkingMode || 'disabled', textApi: body.textApi || 'chat_completions', contextTurns: body.contextTurns === undefined ? 8 : Math.floor(Number(body.contextTurns)), createdAt: new Date().toISOString() }
       db.models.push(created)
       await audit(user, 'model.created', created.id, { provider: created.provider, kind: created.kind, credentialUpdated: Boolean(apiKey) })
       return send(response, 201, { model: safeModel(created) }, origin)
@@ -1225,6 +1273,11 @@ const server = createServer(async (request, response) => {
       if (body.textApi !== undefined) {
         if (!TEXT_APIS.includes(body.textApi)) return send(response, 400, { error: 'invalid_text_api' }, origin)
         target.textApi = body.textApi
+      }
+      if (body.contextTurns !== undefined) {
+        const parsed = Number(body.contextTurns)
+        if (!Number.isFinite(parsed) || parsed < 0 || parsed > MAX_CONTEXT_TURNS) return send(response, 400, { error: 'invalid_context_turns' }, origin)
+        target.contextTurns = Math.floor(parsed)
       }
       if (body.priceUsd !== undefined) {
         const priceNanoUsd = toNanoUsd(body.priceUsd)

@@ -226,18 +226,42 @@ function textRequestPath(model) {
   return textApi(model) === 'responses' ? '/responses' : '/chat/completions'
 }
 
+const MAX_CONTEXT_TURNS = 50
+// Every carried turn is re-sent and re-billed on each message, so the history is
+// capped by turn count and by total characters.
+const MAX_CONTEXT_CHARS = 24000
+
+function contextTurns(model) {
+  const value = Number(model?.contextTurns)
+  if (!Number.isFinite(value) || value < 0) return 0
+  return Math.min(Math.floor(value), MAX_CONTEXT_TURNS)
+}
+
+// Oldest first, trimmed from the front once the character budget is spent, so the
+// most recent exchanges always survive.
+function trimContext(messages) {
+  let total = messages.reduce((sum, message) => sum + message.content.length, 0)
+  let start = 0
+  while (total > MAX_CONTEXT_CHARS && start < messages.length - 1) {
+    total -= messages[start].content.length
+    start += 1
+  }
+  return messages.slice(start)
+}
+
 // 'auto' leaves the decision to the provider default; anything else is explicit,
 // and 'disabled' is the default because a reasoning pass is the main reason a
 // flash-class model takes longer than the request timeout.
-function textRequestBody(model, prompt, { stream = false } = {}) {
+function textRequestBody(model, prompt, { stream = false, history = [] } = {}) {
   const mode = thinkingMode(model)
   const thinking = mode === 'auto' ? {} : { thinking: { type: mode } }
+  const messages = trimContext([...history, { role: 'user', content: prompt }])
   if (textApi(model) === 'responses') {
-    return { model: model.endpoint, input: prompt, ...thinking, ...(stream ? { stream: true } : {}) }
+    return { model: model.endpoint, input: messages, ...thinking, ...(stream ? { stream: true } : {}) }
   }
   return {
     model: model.endpoint,
-    messages: [{ role: 'user', content: prompt }],
+    messages,
     ...thinking,
     ...(stream ? { stream: true, stream_options: { include_usage: true } } : {}),
   }
@@ -276,6 +300,7 @@ function modelFromRow(row) {
     priceNanoUsd: Number(row.price_nano_usd || 0),
     thinkingMode: THINKING_MODES.includes(row.thinking_mode) ? row.thinking_mode : 'disabled',
     textApi: TEXT_APIS.includes(row.text_api) ? row.text_api : 'chat_completions',
+    contextTurns: row.context_turns === null || row.context_turns === undefined ? 8 : Number(row.context_turns),
     createdAt: row.created_at,
     archivedAt: row.archived_at,
   }
@@ -891,9 +916,10 @@ async function dispatchBytePlusGeneration(env, generation, model, credential) {
   const base = bytePlusBase(env)
   const timeoutMs = providerTimeoutMs(env, model.kind)
   if (model.kind === 'text') {
+    const history = await threadContext(env, generation, model)
     const result = await bytePlusRequest(`${base}${textRequestPath(model)}`, credential, env, {
       method: 'POST', kind: model.kind, timeoutMs,
-      body: JSON.stringify(textRequestBody(model, generation.prompt)),
+      body: JSON.stringify(textRequestBody(model, generation.prompt, { history })),
     })
     return { asynchronous: false, result, requestId: result.id || null }
   }
@@ -939,7 +965,7 @@ function streamTextDelta(payload) {
   return ''
 }
 
-async function* bytePlusTextStream(env, prompt, model, credential) {
+async function* bytePlusTextStream(env, prompt, model, credential, history = []) {
   const url = `${bytePlusBase(env)}${textRequestPath(model)}`
   const timeoutMs = providerTimeoutMs(env, 'text', true)
   const startedAt = Date.now()
@@ -952,7 +978,7 @@ async function* bytePlusTextStream(env, prompt, model, credential) {
         'content-type': 'application/json',
         accept: 'text/event-stream',
       },
-      body: JSON.stringify(textRequestBody(model, prompt, { stream: true })),
+      body: JSON.stringify(textRequestBody(model, prompt, { stream: true, history })),
       signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (error) {
@@ -1015,7 +1041,8 @@ function streamTextGeneration(env, ctx, { generation, model, credential, origin,
     try {
       await send('meta', { generation: safeGeneration(generation), session: safeSession(session) })
       await run(env, `UPDATE generations SET provider_state = 'streaming', dispatched_at = ? WHERE id = ?`, nowIso(), generation.id)
-      for await (const chunk of bytePlusTextStream(env, generation.prompt, model, credential)) {
+      const history = await threadContext(env, generation, model)
+      for await (const chunk of bytePlusTextStream(env, generation.prompt, model, credential, history)) {
         if (chunk.requestId) requestId = chunk.requestId
         if (chunk.usage) usage = chunk.usage
         if (!chunk.delta) continue
@@ -1052,6 +1079,24 @@ function streamTextGeneration(env, ctx, { generation, model, credential, origin,
     status: 200,
     headers: responseHeaders(origin, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive', 'x-accel-buffering': 'no' }),
   })
+}
+
+// Earlier turns of the same thread, as alternating user/assistant messages. Only
+// completed turns that actually produced text are carried.
+async function threadContext(env, generation, model) {
+  const turns = contextTurns(model)
+  if (!turns || model.kind !== 'text' || !generation.sessionId) return []
+  const rows = await all(env, `SELECT prompt, result_json FROM generations
+    WHERE session_id = ? AND workspace_id = ? AND id != ? AND status = 'complete'
+    ORDER BY created_at DESC LIMIT ?`, generation.sessionId, WORKSPACE_ID, generation.id, turns)
+  const messages = []
+  for (const row of rows.reverse()) {
+    const answer = providerOutputText(parseJson(row.result_json, null))
+    if (!row.prompt || !answer) continue
+    messages.push({ role: 'user', content: String(row.prompt) })
+    messages.push({ role: 'assistant', content: String(answer) })
+  }
+  return messages
 }
 
 async function generationContext(env, id) {
@@ -1533,18 +1578,23 @@ async function route(request, env, ctx) {
     if (priceNanoUsd === null) throw new ApiError(400, 'invalid_model_price')
     if (body.thinkingMode !== undefined && !THINKING_MODES.includes(body.thinkingMode)) throw new ApiError(400, 'invalid_thinking_mode')
     if (body.textApi !== undefined && !TEXT_APIS.includes(body.textApi)) throw new ApiError(400, 'invalid_text_api')
+    if (body.contextTurns !== undefined) {
+      const parsed = Number(body.contextTurns)
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > MAX_CONTEXT_TURNS) throw new ApiError(400, 'invalid_context_turns')
+    }
     const created = {
       id: crypto.randomUUID(), name: String(body.name).trim().slice(0, 120), description: String(body.description || '').trim().slice(0, 500),
       provider: String(body.provider).trim().slice(0, 120), kind: body.kind, endpoint: String(body.endpoint || '').trim().slice(0, 300) || null,
       status: hasCredential ? (body.status === 'beta' ? 'beta' : 'active') : 'disabled', priceNanoUsd,
       thinkingMode: body.thinkingMode || 'disabled', textApi: body.textApi || 'chat_completions',
+      contextTurns: body.contextTurns === undefined ? 8 : Math.floor(Number(body.contextTurns)),
       createdAt: nowIso(), archivedAt: null,
     }
     await run(env, `INSERT INTO models
-      (id, workspace_id, name, description, provider, kind, endpoint, status, price_nano_usd, thinking_mode, text_api, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, created.id, WORKSPACE_ID, created.name, created.description, created.provider, created.kind, created.endpoint, created.status, created.priceNanoUsd, created.thinkingMode, created.textApi, created.createdAt)
+      (id, workspace_id, name, description, provider, kind, endpoint, status, price_nano_usd, thinking_mode, text_api, context_turns, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, created.id, WORKSPACE_ID, created.name, created.description, created.provider, created.kind, created.endpoint, created.status, created.priceNanoUsd, created.thinkingMode, created.textApi, created.contextTurns, created.createdAt)
     await audit(env, user, 'model.created', created.id, { provider: created.provider, kind: created.kind, credentialUpdated: Boolean(apiKey) })
-    return json({ model: (await safeModels(env, [{ ...created, price_nano_usd: priceNanoUsd, thinking_mode: created.thinkingMode, text_api: created.textApi, created_at: created.createdAt, archived_at: null }]))[0] }, 201, origin)
+    return json({ model: (await safeModels(env, [{ ...created, price_nano_usd: priceNanoUsd, thinking_mode: created.thinkingMode, text_api: created.textApi, context_turns: created.contextTurns, created_at: created.createdAt, archived_at: null }]))[0] }, 201, origin)
   }
 
   if (request.method === 'GET' && path === '/v1/admin/providers') {
@@ -1571,15 +1621,20 @@ async function route(request, env, ctx) {
     }
     if (body.thinkingMode !== undefined && !THINKING_MODES.includes(body.thinkingMode)) throw new ApiError(400, 'invalid_thinking_mode')
     if (body.textApi !== undefined && !TEXT_APIS.includes(body.textApi)) throw new ApiError(400, 'invalid_text_api')
+    if (body.contextTurns !== undefined) {
+      const parsed = Number(body.contextTurns)
+      if (!Number.isFinite(parsed) || parsed < 0 || parsed > MAX_CONTEXT_TURNS) throw new ApiError(400, 'invalid_context_turns')
+    }
     const thinking = body.thinkingMode !== undefined ? body.thinkingMode : target.thinkingMode
     const api = body.textApi !== undefined ? body.textApi : target.textApi
+    const turns = body.contextTurns !== undefined ? Math.floor(Number(body.contextTurns)) : target.contextTurns
     const apiKey = String(body.apiKey || '').trim()
     if (apiKey) await storeCredential(env, provider, apiKey)
-    await run(env, 'UPDATE models SET name = ?, description = ?, provider = ?, kind = ?, endpoint = ?, status = ?, price_nano_usd = ?, thinking_mode = ?, text_api = ? WHERE id = ?',
-      name, description, provider, kind, endpoint, status, priceNanoUsd, thinking, api, target.id)
-    const updated = { ...target, name, description, provider, kind, endpoint, status, priceNanoUsd, thinkingMode: thinking, textApi: api }
+    await run(env, 'UPDATE models SET name = ?, description = ?, provider = ?, kind = ?, endpoint = ?, status = ?, price_nano_usd = ?, thinking_mode = ?, text_api = ?, context_turns = ? WHERE id = ?',
+      name, description, provider, kind, endpoint, status, priceNanoUsd, thinking, api, turns, target.id)
+    const updated = { ...target, name, description, provider, kind, endpoint, status, priceNanoUsd, thinkingMode: thinking, textApi: api, contextTurns: turns }
     await audit(env, user, 'model.updated', target.id, { status, provider, kind, credentialUpdated: Boolean(apiKey) })
-    return json({ model: (await safeModels(env, [{ ...updated, price_nano_usd: priceNanoUsd, thinking_mode: thinking, text_api: api, created_at: updated.createdAt, archived_at: null }]))[0] }, 200, origin)
+    return json({ model: (await safeModels(env, [{ ...updated, price_nano_usd: priceNanoUsd, thinking_mode: thinking, text_api: api, context_turns: turns, created_at: updated.createdAt, archived_at: null }]))[0] }, 200, origin)
   }
 
   if (modelMatch && request.method === 'DELETE') {
@@ -1708,6 +1763,8 @@ export const __test = {
   providerKey,
   providerTimeoutMs,
   maxQueuedMs,
+  contextTurns,
+  trimContext,
   resultUrl,
   streamTextDelta,
   textRequestBody,

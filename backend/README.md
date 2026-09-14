@@ -71,6 +71,12 @@ Text generations are dispatched synchronously against the provider; only video t
 Per-model, set from the admin app when the model kind is Text:
 
 - `thinkingMode` — `disabled` (default), `enabled`, or `auto`. A reasoning pass is the usual reason a flash-class model exceeds its request timeout, and it is billed. `auto` sends no field and leaves the decision to the provider.
+- `contextTurns` — how many earlier exchanges in a chat are resent with each
+  message. Default `8`, `0` disables it, `50` is the ceiling. Only completed
+  turns that produced text are carried, oldest first, and the history is also
+  capped at 24,000 characters so a long thread trims from the front rather than
+  growing without limit. Every carried turn is re-sent and re-billed on each
+  message, which is why this is a per-model setting rather than a constant.
 - `textApi` — `chat_completions` (default) or `responses`. Both are supported so the two endpoints can be compared for latency on the same model without a redeploy.
 
 Per environment:

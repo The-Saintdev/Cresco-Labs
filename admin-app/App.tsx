@@ -142,6 +142,7 @@ function ModelsTab({ data, theme, refresh, onError }: { data: AdminData; theme: 
   const [apiKey, setApiKey] = useState('')
   const [thinking, setThinking] = useState<ThinkingMode>('disabled')
   const [textApi, setTextApi] = useState<TextApi>('chat_completions')
+  const [turns, setTurns] = useState('8')
   const [busy, setBusy] = useState(false)
 
   const [vaultProvider, setVaultProvider] = useState('')
@@ -153,7 +154,7 @@ function ModelsTab({ data, theme, refresh, onError }: { data: AdminData; theme: 
 
   const clear = () => {
     setEditingId(''); setKind('text'); setName(''); setDescription(''); setProvider('')
-    setEndpoint(''); setPrice(''); setApiKey(''); setThinking('disabled'); setTextApi('chat_completions')
+    setEndpoint(''); setPrice(''); setApiKey(''); setThinking('disabled'); setTextApi('chat_completions'); setTurns('8')
   }
 
   const edit = (model: ApiModel) => {
@@ -166,6 +167,7 @@ function ModelsTab({ data, theme, refresh, onError }: { data: AdminData; theme: 
     setPrice(String(Number(model.priceNanoUsd || 0) / 1_000_000_000))
     setThinking(model.thinkingMode || 'disabled')
     setTextApi(model.textApi || 'chat_completions')
+    setTurns(String(model.contextTurns ?? 8))
     setApiKey('')
   }
 
@@ -175,7 +177,7 @@ function ModelsTab({ data, theme, refresh, onError }: { data: AdminData; theme: 
       const input = {
         name: name.trim(), description: description.trim(), provider: provider.trim(), endpoint: endpoint.trim(),
         apiKey: apiKey.trim() || undefined, priceUsd: Number(price), kind,
-        ...(kind === 'text' ? { thinkingMode: thinking, textApi } : {}),
+        ...(kind === 'text' ? { thinkingMode: thinking, textApi, contextTurns: Number(turns) } : {}),
       }
       if (editingId) await apiUpdateModel(editingId, input)
       else await apiCreateModel({ ...input, status: 'active' })
@@ -253,6 +255,15 @@ function ModelsTab({ data, theme, refresh, onError }: { data: AdminData; theme: 
           <Text style={{ fontSize: 12, color: theme.textFaint }}>Reasoning adds latency and billed tokens. Leave it off unless this model needs it.</Text>
         </View>
         <View style={{ gap: 6 }}>
+          <Text style={{ fontSize: 12, fontWeight: '500', color: theme.textMuted }}>Thread context</Text>
+          <Choice
+            value={turns}
+            onChange={setTurns}
+            options={[{ value: '0', label: 'Off' }, { value: '4', label: '4 turns' }, { value: '8', label: '8 turns' }, { value: '16', label: '16 turns' }] as const}
+          />
+          <Text style={{ fontSize: 12, color: theme.textFaint }}>How many earlier exchanges in a chat are resent with each message. Every carried turn is billed again.</Text>
+        </View>
+        <View style={{ gap: 6 }}>
           <Text style={{ fontSize: 12, fontWeight: '500', color: theme.textMuted }}>Text endpoint</Text>
           <Choice
             value={textApi}
@@ -278,7 +289,7 @@ function ModelsTab({ data, theme, refresh, onError }: { data: AdminData; theme: 
             {model.provider} · {model.status}{model.priceNanoUsd ? ` · ${money(model.priceNanoUsd)}/run` : ''}
           </Text>
           {model.kind === 'text' && <Text style={{ fontSize: 12, color: theme.textFaint, marginTop: 2 }}>
-            reasoning {model.thinkingMode || 'disabled'} · {(model.textApi || 'chat_completions') === 'responses' ? 'responses' : 'chat completions'}
+            reasoning {model.thinkingMode || 'disabled'} · {(model.textApi || 'chat_completions') === 'responses' ? 'responses' : 'chat completions'} · context {(model.contextTurns ?? 8) ? `${model.contextTurns ?? 8} turns` : 'off'}
           </Text>}
         </View>
         <Text style={{ fontSize: 11, fontWeight: '600', color: model.executionReady ? theme.success : theme.warn }}>

@@ -20,7 +20,7 @@ export type MobileSession = {
 export type ApiUser = MobileSession['user'] & { createdAt: string }
 export type ThinkingMode = 'disabled' | 'enabled' | 'auto'
 export type TextApi = 'chat_completions' | 'responses'
-export type ApiModel = { id: string; name: string; description?: string; provider: string; kind: 'text' | 'image' | 'video'; status: 'active' | 'beta' | 'disabled'; endpoint?: string | null; priceNanoUsd?: number; thinkingMode?: ThinkingMode; textApi?: TextApi; createdAt: string; credentialConfigured?: boolean; adapterConfigured?: boolean; executionReady?: boolean }
+export type ApiModel = { id: string; name: string; description?: string; provider: string; kind: 'text' | 'image' | 'video'; status: 'active' | 'beta' | 'disabled'; endpoint?: string | null; priceNanoUsd?: number; thinkingMode?: ThinkingMode; textApi?: TextApi; contextTurns?: number; createdAt: string; credentialConfigured?: boolean; adapterConfigured?: boolean; executionReady?: boolean }
 export type ApiUpload = { id: string; ownerEmail: string; fileName: string; contentType: string; size: number; createdAt: string }
 export type ApiGeneration = { id: string; userEmail: string; title: string; modelId: string; modelName?: string; modelProvider?: string; kind: 'text' | 'image' | 'video'; prompt: string; status: 'complete' | 'failed' | 'queued'; costNanoUsd: number; costSource?: 'catalog_estimate' | 'pending_reconciliation' | 'provider'; resultUrl?: string | null; outputText?: string | null; error?: string | null; providerLatencyMs?: number | null; queuedForMs?: number | null; sessionId?: string | null; completedAt?: string | null; references?: ApiUpload[]; createdAt: string }
 export type ApiBalance = { provider: string; amountNanoUsd: number; source: 'provider' | 'ledger'; syncedAt: string }
@@ -156,11 +156,11 @@ export async function createUser(input: { name: string; email: string; password:
   return request<{ user: ApiUser }>('/v1/admin/users', { method: 'POST', body: JSON.stringify(input) })
 }
 
-export async function createModel(input: { name: string; description?: string; provider: string; kind: 'text' | 'image' | 'video'; endpoint?: string; status?: 'active' | 'beta'; apiKey?: string; priceUsd?: number; thinkingMode?: ThinkingMode; textApi?: TextApi }) {
+export async function createModel(input: { name: string; description?: string; provider: string; kind: 'text' | 'image' | 'video'; endpoint?: string; status?: 'active' | 'beta'; apiKey?: string; priceUsd?: number; thinkingMode?: ThinkingMode; textApi?: TextApi; contextTurns?: number }) {
   return request<{ model: ApiModel }>('/v1/admin/models', { method: 'POST', body: JSON.stringify(input) })
 }
 
-export async function updateModel(id: string, changes: { name?: string; description?: string; provider?: string; kind?: 'text' | 'image' | 'video'; endpoint?: string; priceUsd?: number; apiKey?: string; status?: 'active' | 'beta' | 'disabled'; thinkingMode?: ThinkingMode; textApi?: TextApi }) {
+export async function updateModel(id: string, changes: { name?: string; description?: string; provider?: string; kind?: 'text' | 'image' | 'video'; endpoint?: string; priceUsd?: number; apiKey?: string; status?: 'active' | 'beta' | 'disabled'; thinkingMode?: ThinkingMode; textApi?: TextApi; contextTurns?: number }) {
   return request<{ model: ApiModel }>(`/v1/admin/models/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(changes) })
 }
 

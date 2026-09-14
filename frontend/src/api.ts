@@ -24,6 +24,7 @@ export type ApiModel = {
   priceNanoUsd?: number
   thinkingMode?: 'disabled' | 'enabled' | 'auto'
   textApi?: 'chat_completions' | 'responses'
+  contextTurns?: number
   credentialConfigured?: boolean
   adapterConfigured?: boolean
   executionReady?: boolean

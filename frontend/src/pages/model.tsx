@@ -289,7 +289,9 @@ function Thread({ sessionId, model, onModelResolved }: { sessionId?: string; mod
           </div>
         </div>
         {kind === 'text' && <p className="composer-hint thread-note">
-          Each message is sent to {model?.provider} on its own. Earlier turns in this thread are not included as context.
+          {(model?.contextTurns ?? 0) > 0
+            ? `This thread sends up to the last ${model?.contextTurns} exchanges to ${model?.provider} as context, so each message costs more tokens than it does alone.`
+            : `Each message is sent to ${model?.provider} on its own. Earlier turns in this thread are not included as context.`}
         </p>}
       </div>
     </div>
